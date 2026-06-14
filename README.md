@@ -33,7 +33,6 @@ pi install /path/to/pi-prompt-gen
 
 `pi-prompt-gen` is for turning input like:
 
-- `there is an issue with the sidebar the ordering by recently doesn't work`
 - a half-written implementation request
 - a messy bug report turned into a better agent prompt
 
