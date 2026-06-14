@@ -2,7 +2,7 @@
   "name": "pi-prompt-gen",
   "version": "0.1.0",
   "type": "module",
-  "description": "Rewrite prompts inside Pi with a lightweight modal prompt enhancer.",
+  "description": "Generate or rewrite prompts inside Pi with a modal prompt enhancer.",
   "author": "bnema",
   "license": "MIT",
   "keywords": [
