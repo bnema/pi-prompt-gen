@@ -54,11 +54,13 @@ You can also prefill it directly:
 /prompt fix the sidebar sorting by recent first
 ```
 
-Global shortcut:
+Global shortcut registered by the extension:
 
 ```text
 Ctrl+Shift+G
 ```
+
+If your terminal does not report `Ctrl+Shift+G` distinctly, Pi may treat it as `Ctrl+G` and open the external editor instead.
 
 Prefill order:
 
