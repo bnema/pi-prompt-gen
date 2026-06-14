@@ -1,0 +1,56 @@
+{
+  "name": "pi-prompt-gen",
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Rewrite prompts inside Pi with a lightweight modal prompt enhancer.",
+  "author": "bnema",
+  "license": "MIT",
+  "keywords": [
+    "pi",
+    "pi-extension",
+    "prompts",
+    "tui"
+  ],
+  "homepage": "https://github.com/bnema/pi-prompt-gen#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/bnema/pi-prompt-gen.git"
+  },
+  "bugs": {
+    "url": "https://github.com/bnema/pi-prompt-gen/issues"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "files": [
+    "dist/",
+    "extensions/",
+    "src/",
+    "README.md",
+    "LICENSE"
+  ],
+  "pi": {
+    "extensions": [
+      "./extensions/index.ts"
+    ]
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.build.json",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "prepack": "npm run build"
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-ai": ">=0.79.0 <1",
+    "@earendil-works/pi-coding-agent": ">=0.79.0 <1",
+    "@earendil-works/pi-tui": ">=0.79.0 <1"
+  },
+  "devDependencies": {
+    "@earendil-works/pi-ai": "^0.79.0",
+    "@earendil-works/pi-coding-agent": "^0.79.2",
+    "@earendil-works/pi-tui": "^0.79.0",
+    "@types/node": "^25.9.2",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.8"
+  }
+}
