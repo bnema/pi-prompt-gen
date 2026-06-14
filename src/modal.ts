@@ -2,16 +2,19 @@
  * PromptGenModal — overlay component for pi-prompt-gen.
  *
  * Provides a full-screen modal with:
- *  - Embedded multiline draft editor
- *  - Rewrite/generate mode toggle
+ *  - Labeled Draft and Result panes
+ *  - Rewrite/generate mode toggle with mode-specific microcopy
  *  - Enhancement via enhancePrompt() (injected as dependency)
- *  - Result preview pane
+ *  - Result preview pane with truncation warning
  *  - Actions: apply to editor, copy to clipboard, send as user message
  *  - Status feedback (idle, enhancing, enhanced, error)
+ *  - Result metadata (ref count, line count)
+ *  - Prefill source indicator (args/editor/session/blank)
+ *  - Closes on successful send
  *
  * Keybindings:
  *   Enter        enhance / re-enhance
- *   Alt+r        shuffle / regenerate
+ *   Alt+r        regenerate / alternative (materially different output)
  *   Alt+m        toggle rewrite / generate mode
  *   Alt+c        clear draft
  *   Alt+y        yank (copy) enhanced result to clipboard
@@ -25,6 +28,8 @@
  *    Editor's built-in submit / newline logic.
  *  - Shift+Enter inserts a newline in the draft.
  *  - Every enhancement call is a fresh isolated request — no caching.
+ *  - Actions (copy/apply/send) require an enhanced result — no silent
+ *    fallback to the raw draft.
  */
 
 import type { Component as TuiComponent } from "@earendil-works/pi-tui";
@@ -120,8 +125,10 @@ function wrapToWidth(text: string, width: number): WrappedLine[] {
 export type ModalStatus = "idle" | "enhancing" | "enhanced" | "error";
 
 export interface PromptGenModalOptions {
-  /** Initial draft text (prefilled from args / editor / blank). */
+  /** Initial draft text (prefilled from args / editor / session / blank). */
   initialText?: string;
+  /** Optional label describing where initialText came from ("args", "editor", "session", "blank"). */
+  initialTextLabel?: string;
   /** Initial mode. Auto-detected from initialText when not provided. */
   mode?: EnhancerMode;
   /** Callback that performs the actual enhancement. */
@@ -189,8 +196,12 @@ function frameContent(lines: RenderLine[], width: number, title: string, theme: 
   return out;
 }
 
-function separator(width: number, theme: Theme, char = "─"): string {
-  return theme.fg("border", char.repeat(width));
+/** A labeled pane separator like "── Draft ────────────". */
+function paneSeparator(label: string, width: number, theme: Theme): string {
+  const labelDisplay = `── ${label} `;
+  const prefixWidth = visibleWidth(labelDisplay);
+  const fill = Math.max(0, width - prefixWidth);
+  return dim(labelDisplay + "─".repeat(fill), theme);
 }
 
 function dim(text: string, theme: Theme): string {
@@ -248,6 +259,7 @@ export class PromptGenModal implements TuiComponent {
   private sendFn: (text: string) => Promise<void> | void;
   private notifyFn: (message: string, type?: "info" | "warning" | "error") => void;
   private onEnhanceResult: ((result: EnhancePromptResult) => void) | undefined;
+  private initialTextLabel: string | undefined;
 
   constructor(options: PromptGenModalOptions) {
     this.draft = options.initialText ?? "";
@@ -258,6 +270,7 @@ export class PromptGenModal implements TuiComponent {
     this.sendFn = options.sendFn;
     this.notifyFn = options.notifyFn;
     this.onEnhanceResult = options.onEnhanceResult;
+    this.initialTextLabel = options.initialTextLabel;
     this.cursor = this.draft.length;
   }
 
@@ -290,15 +303,19 @@ export class PromptGenModal implements TuiComponent {
 
     const lines: string[] = [];
 
-    // Mode indicator + status line
+    // Mode indicator + status line (with prefill source and mode hint)
     const modeLabel = this.mode === "rewrite" ? "rewrite" : "generate";
+    const modeHint = this.mode === "rewrite"
+      ? "refine a prompt"
+      : "idea \u2192 prompt";
+    const prefillInfo = this.initialTextLabel ? dim(` (${this.initialTextLabel})`, this.theme) : "";
     const modeDisplay = this.status === "enhancing"
-      ? accent(`[${modeLabel}]`, this.theme) + " " + dim("enhancing…", this.theme)
-      : accent(`[${modeLabel}]`, this.theme) + " " + dim(this.statusDisplay(), this.theme);
-    lines.push(modeDisplay);
+      ? accent(`[${modeLabel}]`, this.theme) + " " + dim("enhancing\u2026", this.theme) + prefillInfo
+      : accent(`[${modeLabel}]`, this.theme) + " " + dim(this.statusDisplay(), this.theme) + prefillInfo;
+    lines.push(modeDisplay + "  " + dim(modeHint, this.theme) + " ".repeat(Math.max(0, inner - visibleWidth(modeDisplay) - 2 - visibleWidth(modeHint))));
 
-    // Separator
-    lines.push(dim(separator(inner, this.theme, "─"), this.theme));
+    // Draft pane
+    lines.push(paneSeparator("Draft", inner, this.theme));
 
     // Draft editor area — soft-wrapped to inner width
     this.draftWrapWidth = inner;
@@ -335,8 +352,8 @@ export class PromptGenModal implements TuiComponent {
       }
     }
 
-    // Separator
-    lines.push(dim(separator(inner, this.theme, "─"), this.theme));
+    // Result pane
+    lines.push(paneSeparator("Result", inner, this.theme));
 
     // Result / preview area
     if (this.result) {
@@ -346,7 +363,9 @@ export class PromptGenModal implements TuiComponent {
         lines.push(truncateToWidth(pl, inner) + " ".repeat(Math.max(0, inner - visibleWidth(pl))));
       }
       if (previewLines.length > MAX_PREVIEW_HEIGHT) {
-        lines.push(dim(`… (${previewLines.length - MAX_PREVIEW_HEIGHT} more lines)`, this.theme));
+        const remaining = previewLines.length - MAX_PREVIEW_HEIGHT;
+        const truncatedMsg = dim(`  (${remaining} more line${remaining > 1 ? "s" : ""} — actions use full result)`, this.theme);
+        lines.push(truncatedMsg + " ".repeat(Math.max(0, inner - visibleWidth(truncatedMsg))));
       } else if (displayLines.length < MAX_PREVIEW_HEIGHT) {
         for (let i = displayLines.length; i < MAX_PREVIEW_HEIGHT; i++) {
           lines.push("");
@@ -360,20 +379,42 @@ export class PromptGenModal implements TuiComponent {
       for (let i = 1; i < MAX_PREVIEW_HEIGHT; i++) lines.push("");
     }
 
-    // Status bar
-    if (this.result && this.result.refs.length > 0) {
-      const refList = this.result.refs.map((r) => r.path).join(", ");
-      lines.push(dim(`refs: ${truncateToWidth(refList, inner - 6)}`, this.theme));
+    // Metadata line
+    if (this.result) {
+      const parts: string[] = [];
+      const refCount = this.result.refs.length;
+      const lineCount = this.result.enhancedPrompt.split("\n").length;
+      if (refCount > 0) {
+        parts.push(`\u25cf ${refCount} ref${refCount > 1 ? "s" : ""}`);
+      }
+      parts.push(`${lineCount} line${lineCount > 1 ? "s" : ""}`);
+      const meta = dim(parts.join(" \u00b7 "), this.theme);
+      lines.push(meta + " ".repeat(Math.max(0, inner - visibleWidth(meta))));
     } else {
       lines.push("");
     }
 
-    // Help line
-    const help = dim(
-      "Enter · Alt+r · Alt+m · Alt+c · Alt+y · Alt+a · Alt+s · Esc close",
-      this.theme,
-    );
-    lines.push(help);
+    // Help lines (state-aware)
+    const hasResult = this.status === "enhanced" && this.result !== undefined;
+    if (hasResult) {
+      lines.push(dim(
+        `[Enter] Re-enhance  [Alt+R] Alternative  [Alt+M] Mode  [Alt+C] Clear`,
+        this.theme,
+      ));
+      lines.push(dim(
+        `[Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
+        this.theme,
+      ));
+    } else {
+      lines.push(dim(
+        `[Enter] Enhance  [Alt+M] Mode  [Alt+C] Clear  [Esc] Close`,
+        this.theme,
+      ));
+      lines.push(dim(
+        `[Alt+R] Regenerate  [Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send`,
+        this.theme,
+      ));
+    }
 
     return frameContent(lines, width, "/prompt", this.theme);
   }
@@ -401,6 +442,7 @@ export class PromptGenModal implements TuiComponent {
     if (this.status === "enhancing") return;
 
     // Alt shortcuts (must be checked before printable characters)
+    // Alt+r regenerates / requests an alternative
     if (this.matchesAction(data, "alt+r", Key.alt("r"))) {
       void this.runEnhancement(true);
       return;
@@ -706,9 +748,9 @@ export class PromptGenModal implements TuiComponent {
   }
 
   private async copyResult(): Promise<void> {
-    const text = this.result?.enhancedPrompt ?? this.draft.trim();
+    const text = this.result?.enhancedPrompt;
     if (!text) {
-      this.notifyFn("Nothing to copy.", "warning");
+      this.notifyFn("No enhanced result to copy. Enhance draft first.", "warning");
       return;
     }
     try {
@@ -720,9 +762,9 @@ export class PromptGenModal implements TuiComponent {
   }
 
   private applyResult(): void {
-    const text = this.result?.enhancedPrompt ?? this.draft.trim();
+    const text = this.result?.enhancedPrompt;
     if (!text) {
-      this.notifyFn("Nothing to apply.", "warning");
+      this.notifyFn("No enhanced result to apply. Enhance draft first.", "warning");
       return;
     }
     this.applyFn(text);
@@ -730,14 +772,15 @@ export class PromptGenModal implements TuiComponent {
   }
 
   private async sendResult(): Promise<void> {
-    const text = this.result?.enhancedPrompt ?? this.draft.trim();
+    const text = this.result?.enhancedPrompt;
     if (!text) {
-      this.notifyFn("Nothing to send.", "warning");
+      this.notifyFn("No enhanced result to send. Enhance draft first.", "warning");
       return;
     }
     try {
       await this.sendFn(text);
-      this.notifyFn("Sent as user message.", "info");
+      // Close modal on successful send
+      this.done({ draftText: this.draft, lastResult: this.result });
     } catch {
       this.notifyFn("Failed to send prompt.", "error");
     }

@@ -24,6 +24,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 
     const initialText = resolveInitialText(args, ctx);
     const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
+    const initialTextLabel = resolvePrefillLabel(args, ctx);
 
     const model = ctx.model;
     if (!model) {
@@ -70,6 +71,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 
     const modal = new PromptGenModal({
       initialText,
+      initialTextLabel,
       mode: initialMode,
       enhanceFn,
       copyFn: copyToClipboard,
@@ -125,6 +127,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 
       const initialText = resolveShortcutPrefill(ctx);
       const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
+      const initialTextLabel = resolveShortcutPrefillLabel(ctx);
       const model = ctx.model;
       if (!model) {
         ctx.ui.notify("No active model. Select a model before using pi-prompt-gen.", "error");
@@ -161,6 +164,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 
       const modal = new PromptGenModal({
         initialText,
+        initialTextLabel,
         mode: initialMode,
         enhanceFn,
         copyFn: copyToClipboard,
@@ -237,6 +241,37 @@ function extractMessageText(content: unknown): string {
     .filter(Boolean)
     .join("\n")
     .trim();
+}
+
+// ---------------------------------------------------------------------------
+// Prefill source labels
+// ---------------------------------------------------------------------------
+
+function resolvePrefillLabel(args: string, ctx: ExtensionCommandContext): string {
+  if (args.trim()) return "from args";
+  return resolveShortcutPrefillLabel(ctx);
+}
+
+function resolveShortcutPrefillLabel(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui" | "sessionManager">): string {
+  if (ctx.hasUI) {
+    const editorText = ctx.ui.getEditorText()?.trim();
+    if (editorText) return "from editor";
+  }
+
+  const branchEntries = typeof ctx.sessionManager?.getBranch === "function"
+    ? ctx.sessionManager.getBranch()
+    : typeof ctx.sessionManager?.getEntries === "function"
+      ? ctx.sessionManager.getEntries()
+      : [];
+
+  for (let i = branchEntries.length - 1; i >= 0; i--) {
+    const entry = branchEntries[i] as { type?: string; message?: { role?: string; content?: unknown } };
+    if (entry?.type !== "message" || entry.message?.role !== "user") continue;
+    const text = extractMessageText(entry.message.content);
+    if (text) return "from session";
+  }
+
+  return "blank";
 }
 
 // ---------------------------------------------------------------------------
