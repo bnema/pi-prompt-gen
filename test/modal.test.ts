@@ -6,7 +6,7 @@
  *  - Mode auto-detection (rewrite when prefilled, generate when blank)
  *  - Text editing operations (insert, backspace, delete, cursor navigation)
  *  - Actions: copy, apply, send, clear, close
- *  - Shuffle (Alt+r) issues a fresh isolated request
+ *  - Regenerate / Alternative (Alt+r) issues a fresh isolated request
  *  - Enhancement status lifecycle (idle → enhancing → enhanced / error)
  *  - Mode toggle (Alt+m)
  */
@@ -417,29 +417,61 @@ describe("PromptGenModal actions", () => {
     });
   });
 
-  it("applyFn is called on Alt+a", () => {
+  it("applyFn requires enhanced result on Alt+a", async () => {
     const applyFn = vi.fn();
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      enhancedPrompt: "Enhanced output",
+    }));
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "test",
       applyFn,
+      enhanceFn,
     }));
-    bindModal(modal);
+    const renderSpy = vi.fn();
+    bindModal(modal, renderSpy);
 
-    // Alt+a when there's text should call applyFn with draft
+    // Enhance first
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const lines = modal.render(80);
+      expect(lines.join("\n")).toContain("Enhanced output");
+    });
+
+    // Alt+a should apply the enhanced result, not the draft
     press(modal, "\u001ba"); // Alt+a
-    expect(applyFn).toHaveBeenCalledWith("test");
+    expect(applyFn).toHaveBeenCalledWith("Enhanced output");
   });
 
-  it("sendFn is called on Alt+s", () => {
-    const sendFn = vi.fn();
+  it("sendFn requires enhanced result on Alt+s", async () => {
+    const sendFn = vi.fn().mockResolvedValue(undefined);
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      enhancedPrompt: "Enhanced to send",
+    }));
+    const done = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
-      initialText: "test message",
+      initialText: "test",
+      enhanceFn,
       sendFn,
     }));
-    bindModal(modal);
+    const renderSpy = vi.fn();
+    bindModal(modal, renderSpy, done);
 
+    // Enhance first
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const lines = modal.render(80);
+      expect(lines.join("\n")).toContain("Enhanced to send");
+    });
+
+    // Alt+s should send and close
     press(modal, "\u001bs"); // Alt+s
-    expect(sendFn).toHaveBeenCalledWith("test message");
+    await vi.waitFor(() => {
+      expect(sendFn).toHaveBeenCalledWith("Enhanced to send");
+      // Modal should close on successful send
+      expect(done).toHaveBeenCalledWith(expect.objectContaining({
+        draftText: "test",
+      }));
+    });
   });
 
   it("done is called with result on Escape", () => {
@@ -467,11 +499,13 @@ describe("PromptGenModal actions", () => {
     expect(lines.join("\n")).not.toContain("hello");
   });
 
-  it("editing after enhancement invalidates stale result before apply", async () => {
+  it("editing after enhancement invalidates stale result so apply notifies", async () => {
     const applyFn = vi.fn();
+    const notifyFn = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "hello",
       applyFn,
+      notifyFn,
     }));
     bindModal(modal);
 
@@ -481,19 +515,25 @@ describe("PromptGenModal actions", () => {
     });
 
     type(modal, "!");
-    press(modal, "\u001ba"); // Alt+a
-
-    expect(applyFn).toHaveBeenCalledWith("hello!");
+    // After editing, stale result is cleared
     expect(modal.render(80).join("\n")).not.toContain("Enhanced");
+
+    // Apply should notify instead of silently using draft
+    press(modal, "\u001ba"); // Alt+a
+    expect(applyFn).not.toHaveBeenCalled();
+    expect(notifyFn).toHaveBeenCalledWith(
+      "No enhanced result to apply. Enhance draft first.",
+      "warning",
+    );
   });
 });
 
-describe("PromptGenModal shuffle/regenerate", () => {
+describe("PromptGenModal regenerate/alternative", () => {
   it("Alt+r calls enhanceFn fresh each time", async () => {
     const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
     const onEnhanceResult = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
-      initialText: "test shuffle",
+      initialText: "test regenerate",
       enhanceFn,
       onEnhanceResult,
     }));
@@ -506,13 +546,13 @@ describe("PromptGenModal shuffle/regenerate", () => {
       expect(enhanceFn).toHaveBeenCalledTimes(1);
     });
 
-    // Shuffle via Alt+r
+    // Regenerate via Alt+r
     press(modal, "\u001br"); // Alt+r
     await vi.waitFor(() => {
       // Called again with same text and the previous output as a variation hint
       expect(enhanceFn).toHaveBeenCalledTimes(2);
       expect(enhanceFn).toHaveBeenLastCalledWith(
-        "test shuffle",
+        "test regenerate",
         "rewrite",
         expect.any(AbortSignal),
         "Enhanced: fix the sidebar sort order to use `createdAt` descending.",
@@ -520,7 +560,7 @@ describe("PromptGenModal shuffle/regenerate", () => {
     });
   });
 
-  it("shuffle with blank draft shows warning", () => {
+  it("regenerate with blank draft shows warning", () => {
     const notifyFn = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "",
@@ -590,24 +630,98 @@ describe("PromptGenModal render output", () => {
     expect(joined).toContain("╰");
   });
 
-  it("shows help line with shortcuts", () => {
+  it("shows two help lines with labeled shortcuts", () => {
     const modal = new PromptGenModal(makeModalOptions({ initialText: "hello" }));
     bindModal(modal);
 
     const joined = modal.render(80).join("\n");
-    expect(joined).toContain("Enter");
-    expect(joined).toContain("Alt+r");
-    expect(joined).toContain("Alt+m");
-    expect(joined).toContain("Alt+c");
-    expect(joined).toContain("Alt+y");
-    expect(joined).toContain("Alt+a");
-    expect(joined).toContain("Alt+s");
-    expect(joined).toContain("Esc close");
+    // When idle (no result yet), show primary action help
+    expect(joined).toContain("[Enter] Enhance");
+    expect(joined).toContain("[Alt+M] Mode");
+    expect(joined).toContain("[Alt+C] Clear");
+    expect(joined).toContain("[Esc] Close");
+    // Secondary actions still shown
+    expect(joined).toContain("[Alt+R] Regenerate");
+    expect(joined).toContain("[Alt+Y] Copy");
+    expect(joined).toContain("[Alt+A] Apply");
+    expect(joined).toContain("[Alt+S] Send");
   });
 
-  it("shows refs when result has refs", async () => {
+  it("shows re-enhance help after enhancement", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const lines = modal.render(80);
+      const joined = lines.join("\n");
+      // After enhancement, show result-focused actions
+      expect(joined).toContain("[Enter] Re-enhance");
+      expect(joined).toContain("[Alt+R] Alternative");
+      expect(joined).toContain("[Alt+Y] Copy");
+      expect(joined).toContain("[Alt+A] Apply");
+      expect(joined).toContain("[Alt+S] Send");
+    });
+  });
+
+  it("shows labeled Draft and Result pane separators", () => {
+    const modal = new PromptGenModal(makeModalOptions({ initialText: "hello" }));
+    bindModal(modal);
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("── Draft ");
+    expect(joined).toContain("── Result ");
+  });
+
+  it("shows mode-specific microcopy (refine a prompt / idea → prompt)", () => {
+    const rewriteModal = new PromptGenModal(makeModalOptions({ mode: "rewrite" }));
+    bindModal(rewriteModal);
+    expect(rewriteModal.render(80).join("\n")).toContain("refine a prompt");
+
+    const generateModal = new PromptGenModal(makeModalOptions({ initialText: "", mode: "generate" }));
+    bindModal(generateModal);
+    expect(generateModal.render(80).join("\n")).toContain("idea");
+    expect(generateModal.render(80).join("\n")).toContain("prompt");
+  });
+
+  it("shows prefill source label when provided", () => {
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      initialTextLabel: "from args",
+    }));
+    bindModal(modal);
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("(from args)");
+  });
+
+  it("shows truncation warning when result exceeds preview height", async () => {
+    const longPrompt = Array.from({ length: 15 }, (_, i) => `Line ${i + 1} of a long result.`).join("\n");
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      enhancedPrompt: longPrompt,
+    }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "long prompt",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      expect(joined).toContain("5 more lines");
+      expect(joined).toContain("actions use full result");
+    });
+  });
+
+  it("shows result metadata with ref count and line count", async () => {
     const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
       refs: [{ path: "src/Sidebar.tsx", score: 65, isEntrypoint: true, lineCount: 120 }],
+      enhancedPrompt: "Enhanced result with a few words.",
     }));
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "sidebar sort",
@@ -618,13 +732,40 @@ describe("PromptGenModal render output", () => {
     press(modal, "\r");
     await vi.waitFor(() => {
       const lines = modal.render(80);
-      expect(lines.join("\n")).toContain("src/Sidebar.tsx");
+      const joined = lines.join("\n");
+      // Metadata shows ref count and line count
+      expect(joined).toContain("●");
+      expect(joined).toContain("1 ref");
+      expect(joined).toContain("·");
+      expect(joined).toContain("1 line");
+    });
+  });
+
+  it("shows metadata without refs when result has no refs", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      refs: [],
+      enhancedPrompt: "Short result.",
+    }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const lines = modal.render(80);
+      const joined = lines.join("\n");
+      // Metadata shows just line count when no refs
+      expect(joined).toContain("1 line");
+      // No ref bullet
+      expect(joined).not.toContain("●");
     });
   });
 });
 
 describe("PromptGenModal result notifications", () => {
-  it("notifies when trying to copy empty text", () => {
+  it("notifies when trying to copy without enhancement", () => {
     const notifyFn = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "",
@@ -633,10 +774,10 @@ describe("PromptGenModal result notifications", () => {
     bindModal(modal);
 
     press(modal, "\u001by"); // Alt+y (copy)
-    expect(notifyFn).toHaveBeenCalledWith("Nothing to copy.", "warning");
+    expect(notifyFn).toHaveBeenCalledWith("No enhanced result to copy. Enhance draft first.", "warning");
   });
 
-  it("notifies when trying to apply empty text", () => {
+  it("notifies when trying to apply without enhancement", () => {
     const notifyFn = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "",
@@ -645,10 +786,10 @@ describe("PromptGenModal result notifications", () => {
     bindModal(modal);
 
     press(modal, "\u001ba"); // Alt+a (apply)
-    expect(notifyFn).toHaveBeenCalledWith("Nothing to apply.", "warning");
+    expect(notifyFn).toHaveBeenCalledWith("No enhanced result to apply. Enhance draft first.", "warning");
   });
 
-  it("notifies when trying to send empty text", () => {
+  it("notifies when trying to send without enhancement", () => {
     const notifyFn = vi.fn();
     const modal = new PromptGenModal(makeModalOptions({
       initialText: "",
@@ -657,7 +798,20 @@ describe("PromptGenModal result notifications", () => {
     bindModal(modal);
 
     press(modal, "\u001bs"); // Alt+s (send)
-    expect(notifyFn).toHaveBeenCalledWith("Nothing to send.", "warning");
+    expect(notifyFn).toHaveBeenCalledWith("No enhanced result to send. Enhance draft first.", "warning");
+  });
+
+  it("notifies when trying to copy with draft text but no enhancement", () => {
+    const notifyFn = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "some draft text",
+      notifyFn,
+    }));
+    bindModal(modal);
+
+    // Even though there's draft text, copy requires an enhanced result
+    press(modal, "\u001by"); // Alt+y (copy)
+    expect(notifyFn).toHaveBeenCalledWith("No enhanced result to copy. Enhance draft first.", "warning");
   });
 });
 
