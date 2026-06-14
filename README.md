@@ -11,6 +11,24 @@ Generate or rewrite prompts inside Pi with a modal prompt enhancer.
 - keeps enhancement calls isolated from the parent session history and session id
 - stays strictly in prompt-generation mode instead of solving the underlying task
 
+## Install
+
+```bash
+pi install git:github.com/bnema/pi-prompt-gen
+```
+
+Or install from a local checkout while developing:
+
+```bash
+pi install /path/to/pi-prompt-gen
+```
+
+## Requirements
+
+- Pi with extension loading enabled
+- Node.js 20+
+- Pi TUI for the full modal experience
+
 ## How it behaves
 
 `pi-prompt-gen` is for turning input like:
@@ -55,17 +73,33 @@ Default mode:
 - non-empty draft → `rewrite`
 - blank draft → `generate`
 
+## Modal model
+
+The modal is organized as:
+
+- **Draft** — the text you are refining or expanding from
+- **Result** — the enhanced prompt preview produced by the isolated model call
+
+Mode labels are explicit in the UI:
+
+- `rewrite` → refine a prompt
+- `generate` → idea → prompt
+
 ## Modal shortcuts
 
-- `Enter` — enhance the current draft
+- `Enter` — enhance the current draft, then re-enhance after a result exists
 - `Shift+Enter` — insert newline
 - `Alt+M` — toggle rewrite/generate mode
 - `Alt+R` — regenerate a materially different alternative with a fresh isolated request
 - `Alt+C` — clear the draft
-- `Alt+Y` — copy the current result to the clipboard
-- `Alt+A` — apply the current result back into the main Pi editor
-- `Alt+S` — send the current result as a user message
+- `Alt+Y` — copy the enhanced result
+- `Alt+A` — apply the enhanced result back into the main Pi editor
+- `Alt+S` — send the enhanced result as a user message and close the modal
 - `Esc` — close the modal, or abort the in-flight enhancement
+
+`copy`, `apply`, and `send` operate on the **enhanced result** only. If no result exists yet, the modal asks you to enhance first instead of silently using the raw draft.
+
+If the preview is truncated, the modal tells you that the hidden lines still count: copy/apply/send use the full result.
 
 ## Isolation guarantees
 

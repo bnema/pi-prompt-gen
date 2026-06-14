@@ -93,7 +93,7 @@ export interface EnhancePromptResult {
  *
  * const result = await enhancePrompt({
  *   input: "fix the sidebar sort order",
- *   cwd: "/home/user/project",
+ *   cwd: "/path/to/project",
  *   mode: "rewrite",
  *   model: currentModel,
  *   apiKey: process.env.ANTHROPIC_API_KEY!,
