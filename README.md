@@ -77,13 +77,13 @@ Default mode:
 
 ## Browse pass
 
-Before generating the final enhanced prompt, `pi-prompt-gen` now runs an isolated read-only browse pass that can:
+Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated read-only browse pass when safe local browse tools are available. That pass can:
 
 - inspect the repository with read-only file tools: `read`, `grep`, `find`, `ls`
 - use local code and project-discovery tools when available: `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, `codegraph_status`
 - select a small set of relevant file refs to inject into the final prompt
 
-The modal shows progress while this happens, so you can see when it is examining the codebase, using tools, and generating the final prompt.
+When that browse pass runs, the modal shows progress so you can see when it is examining the codebase, using tools, and generating the final prompt.
 
 ## Modal model
 
