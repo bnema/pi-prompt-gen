@@ -33,7 +33,7 @@
  */
 
 import type { Component as TuiComponent } from "@earendil-works/pi-tui";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { EnhancePromptResult } from "./index.js";
 import type { EnhancerMode } from "./enhancer-prompt.js";
@@ -252,6 +252,8 @@ export class PromptGenModal implements TuiComponent {
   private spinnerFrameIndex = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
   private progressLog: string[] = [];
+  private pasteBuffer = "";
+  private isInPaste = false;
 
   // ---- injected ----
   private theme!: Theme;
@@ -447,6 +449,7 @@ export class PromptGenModal implements TuiComponent {
         this.requestVersion += 1;
         this.activeAbort?.abort();
         this.activeAbort = undefined;
+        this.resetPasteState();
         this.setStatus("idle", "cancelled");
         this.requestRender();
         return;
@@ -455,8 +458,18 @@ export class PromptGenModal implements TuiComponent {
       return;
     }
 
-    // Block other input during enhancement
-    if (this.status === "enhancing") return;
+    // Block other input during enhancement, including paste buffers, so a result
+    // cannot land for stale text after the visible draft has already changed.
+    if (this.status === "enhancing") {
+      if (this.isInPaste || data.includes("\x1b[200~")) {
+        this.resetPasteState();
+      }
+      return;
+    }
+
+    if (this.handleBracketedPasteInput(data)) {
+      return;
+    }
 
     // Alt shortcuts (must be checked before printable characters)
     // Alt+r regenerates / requests an alternative
@@ -488,7 +501,7 @@ export class PromptGenModal implements TuiComponent {
     }
 
     // Enter (bare) → enhance
-    if (this.matchesAction(data, "tui.input.submit", Key.enter) || matchesKey(data, Key.return)) {
+    if (this.matchesAction(data, "tui.input.submit", Key.enter) || matchesKey(data, Key.return) || data === "\n") {
       void this.runEnhancement();
       return;
     }
@@ -578,9 +591,16 @@ export class PromptGenModal implements TuiComponent {
       return;
     }
 
+    const kittyPrintable = decodeKittyPrintable(data);
+    if (kittyPrintable !== undefined) {
+      this.insertAtCursor(kittyPrintable);
+      this.requestRender();
+      return;
+    }
+
     // Printable character insertion
-    if (this.isPrintable(data)) {
-      this.insertAtCursor(data);
+    if (this.isTextInputChunk(data)) {
+      this.insertAtCursor(this.normalizeTextInput(data));
       this.requestRender();
       return;
     }
@@ -590,8 +610,57 @@ export class PromptGenModal implements TuiComponent {
   // Text editing helpers
   // ---------------------------------------------------------------
 
-  private isPrintable(data: string): boolean {
-    return data.length === 1 && data >= " " && data !== "\x7f";
+  private isTextInputChunk(data: string): boolean {
+    if (data.length === 0) return false;
+
+    return [...data].every((ch) => {
+      if (ch === "\n" || ch === "\r" || ch === "\t") return true;
+
+      const code = ch.charCodeAt(0);
+      return code >= 32 && code !== 0x7f && !(code >= 0x80 && code <= 0x9f);
+    });
+  }
+
+  private normalizeTextInput(text: string): string {
+    return text.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  }
+
+  private handleBracketedPasteInput(data: string): boolean {
+    // Pi TUI re-wraps each completed paste into one bracketed-paste input chunk,
+    // so this modal only needs to handle whole-sequence paste events here.
+    if (data.includes("\x1b[200~")) {
+      this.isInPaste = true;
+      this.pasteBuffer = "";
+      data = data.replace("\x1b[200~", "");
+    }
+
+    if (!this.isInPaste) return false;
+
+    this.pasteBuffer += data;
+    const endIndex = this.pasteBuffer.indexOf("\x1b[201~");
+    if (endIndex === -1) return true;
+
+    const pasteContent = this.pasteBuffer.substring(0, endIndex);
+    const remaining = this.pasteBuffer.substring(endIndex + 6);
+    this.isInPaste = false;
+    this.pasteBuffer = "";
+
+    if (pasteContent.length > 0) {
+      this.insertAtCursor(this.normalizeTextInput(pasteContent));
+    }
+
+    if (remaining.length > 0) {
+      this.handleInput(remaining);
+    } else {
+      this.requestRender();
+    }
+
+    return true;
+  }
+
+  private resetPasteState(): void {
+    this.isInPaste = false;
+    this.pasteBuffer = "";
   }
 
   private insertAtCursor(text: string): void {

@@ -77,13 +77,13 @@ Default mode:
 
 ## Browse pass
 
-Before generating the final enhanced prompt, `pi-prompt-gen` now runs an isolated read-only browse pass that can:
+Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated read-only browse pass when safe local browse tools are available. That pass can:
 
 - inspect the repository with read-only file tools: `read`, `grep`, `find`, `ls`
 - use local code and project-discovery tools when available: `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, `codegraph_status`
 - select a small set of relevant file refs to inject into the final prompt
 
-The modal shows progress while this happens, so you can see when it is examining the codebase, using tools, and generating the final prompt.
+When that browse pass runs, the modal shows progress so you can see when it is examining the codebase, using tools, and generating the final prompt.
 
 ## Modal model
 
@@ -106,7 +106,7 @@ Mode labels are explicit in the UI:
 - `Alt+C` — clear the draft
 - `Alt+Y` — copy the enhanced result
 - `Alt+A` — apply the enhanced result back into the main Pi editor
-- `Alt+S` — send the enhanced result as a user message and close the modal
+- `Alt+S` — send the enhanced result as a user message, clear the parent editor, and close the modal
 - `Esc` — close the modal, or abort the in-flight enhancement
 
 `copy`, `apply`, and `send` operate on the **enhanced result** only. If no result exists yet, the modal asks you to enhance first instead of silently using the raw draft.

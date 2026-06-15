@@ -213,6 +213,34 @@ describe("PromptGenModal text editing", () => {
     expect(lines.join("\n")).toContain("abc");
   });
 
+  it("accepts printable text chunks longer than one character", () => {
+    const modal = new PromptGenModal(makeModalOptions({ initialText: "draft" }));
+    bindModal(modal);
+
+    modal.render(80);
+    press(modal, " + pasted chunk");
+
+    const lines = modal.render(80);
+    expect(lines.join("\n")).toContain("draft + pasted chunk");
+  });
+
+  it("preserves bracketed paste content after initial render without retriggering initial prefill", () => {
+    const enhanceFn = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "existing draft",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    modal.render(80);
+    press(modal, "\u001b[200~ + pasted line 1\npasted line 2\u001b[201~");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("existing draft + pasted line 1");
+    expect(joined).toContain("pasted line 2");
+    expect(enhanceFn).not.toHaveBeenCalled();
+  });
+
   it("backspace removes character before cursor", () => {
     const modal = new PromptGenModal(makeModalOptions({ initialText: "abc" }));
     bindModal(modal);
@@ -427,6 +455,34 @@ describe("PromptGenModal enhancement lifecycle", () => {
 
     resolvePromise(makeEnhanceResult());
     await vi.runAllTimersAsync();
+  });
+
+  it("ignores bracketed paste while enhancement is in progress", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockImplementation(async () => {
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    press(modal, "\u001b[200~ + pasted while enhancing\u001b[201~");
+
+    const joinedWhileEnhancing = modal.render(80).join("\n");
+    expect(joinedWhileEnhancing).toContain("test");
+    expect(joinedWhileEnhancing).not.toContain("pasted while enhancing");
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+
+    const joinedAfter = modal.render(80).join("\n");
+    expect(joinedAfter).toContain("test");
+    expect(joinedAfter).not.toContain("pasted while enhancing");
   });
 
   it("normalizes multiline progress messages to a single rendered line", async () => {
