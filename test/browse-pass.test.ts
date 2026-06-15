@@ -3,7 +3,7 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -150,10 +150,27 @@ describe("browseCodebase", () => {
     }));
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       thinkingLevel: "off",
+      tools: ["read", "grep"],
     }));
     expect(refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
+  });
+
+  it("filters unsafe tools before creating the temporary agent session", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+
+    await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read", "write", "web_search", "code_search"],
+    });
+
+    expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
+      tools: ["read", "code_search"],
+    }));
   });
 
   it("keeps only safe repo-relative refs that exist under cwd", async () => {
@@ -193,6 +210,112 @@ describe("browseCodebase", () => {
     expect(refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
       { path: "src/other.ts", score: 50, isEntrypoint: false },
+    ]);
+  });
+
+  it("normalizes non-finite maxRefs before building prompts and limiting refs", async () => {
+    const repo = await makeRepo({
+      "src/index.ts": "export const ok = true;",
+      "src/other.ts": "export const other = true;",
+    });
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [
+                { path: "src/index.ts", score: 97, isEntrypoint: true },
+                { path: "src/other.ts", score: 88, isEntrypoint: false },
+              ],
+            }),
+          },
+        ],
+      },
+    ];
+
+    const refs = await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      maxRefs: Number.NaN,
+    });
+
+    expect(mockPrompt).toHaveBeenCalledWith(expect.stringContaining("at most 5 file refs"));
+    expect(refs).toHaveLength(2);
+  });
+
+  it("rounds down fractional maxRefs before limiting refs", async () => {
+    const repo = await makeRepo({
+      "src/index.ts": "export const ok = true;",
+      "src/other.ts": "export const other = true;",
+    });
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [
+                { path: "src/index.ts", score: 97, isEntrypoint: true },
+                { path: "src/other.ts", score: 88, isEntrypoint: false },
+              ],
+            }),
+          },
+        ],
+      },
+    ];
+
+    const refs = await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      maxRefs: 1.8,
+    });
+
+    expect(mockPrompt).toHaveBeenCalledWith(expect.stringContaining("at most 1 file refs"));
+    expect(refs).toEqual([
+      { path: "src/index.ts", score: 97, isEntrypoint: true },
+    ]);
+  });
+
+  it("drops symlinked refs that resolve outside the repository", async () => {
+    const outsideRoot = await makeRepo({ "outside.ts": "export const outside = true;" });
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    await symlink(join(outsideRoot, "outside.ts"), join(repo, "src", "linked-outside.ts"));
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [
+                { path: "src/index.ts", score: 97, isEntrypoint: true },
+                { path: "src/linked-outside.ts", score: 90, isEntrypoint: false },
+              ],
+            }),
+          },
+        ],
+      },
+    ];
+
+    const refs = await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+    });
+
+    expect(refs).toEqual([
+      { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
   });
 
@@ -274,6 +397,28 @@ describe("browseCodebase", () => {
 
     expect(mockAbort).toHaveBeenCalledTimes(1);
     expect(mockUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("cleans up the session if the signal aborts immediately after session creation", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    const controller = new AbortController();
+
+    mockCreateAgentSession.mockImplementationOnce(async () => {
+      controller.abort();
+      return { session: mockSession };
+    });
+
+    await expect(browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      signal: controller.signal,
+    })).rejects.toThrow(/abort/i);
+
+    expect(mockSession.subscribe).not.toHaveBeenCalled();
     expect(mockDispose).toHaveBeenCalledTimes(1);
   });
 

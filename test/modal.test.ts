@@ -429,6 +429,30 @@ describe("PromptGenModal enhancement lifecycle", () => {
     await vi.runAllTimersAsync();
   });
 
+  it("normalizes multiline progress messages to a single rendered line", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      onProgress?.("Reading src/index.ts…\nextra detail");
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("Reading src/index.ts… extra detail");
+    expect(joined).not.toContain("Reading src/index.ts…\nextra detail");
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+  });
+
   it("ignores late progress updates after the request is aborted", async () => {
     let resolvePromise!: (val: EnhancePromptResult) => void;
     let progress!: (message: string) => void;

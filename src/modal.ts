@@ -839,8 +839,9 @@ export class PromptGenModal implements TuiComponent {
   }
 
   private pushProgress(message: string): void {
-    if (this.progressLog[this.progressLog.length - 1] === message) return;
-    this.progressLog.push(message);
+    const normalizedMessage = message.replace(/[\r\n]+/g, " ").trim();
+    if (!normalizedMessage || this.progressLog[this.progressLog.length - 1] === normalizedMessage) return;
+    this.progressLog.push(normalizedMessage);
     if (this.progressLog.length > MAX_PREVIEW_HEIGHT) this.progressLog.shift();
   }
 

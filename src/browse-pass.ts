@@ -5,7 +5,7 @@
  * to examine the codebase, then returns a minimal JSON list of relevant refs.
  */
 
-import { stat } from "node:fs/promises";
+import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 import {
@@ -20,6 +20,19 @@ import {
 import type { Ref } from "./index.js";
 
 const DEFAULT_MAX_REFS = 5;
+
+export const SAFE_BROWSE_TOOL_NAMES = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "code_search",
+  "project_memory_read",
+  "project_memory_search",
+  "codegraph_explore",
+  "codegraph_node",
+  "codegraph_status",
+]);
 
 interface ParsedRef {
   path: string;
@@ -48,12 +61,15 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
     headers,
     tools,
     signal,
-    maxRefs = DEFAULT_MAX_REFS,
+    maxRefs: rawMaxRefs = DEFAULT_MAX_REFS,
     onProgress,
   } = options;
 
+  const maxRefs = normalizeMaxRefs(rawMaxRefs);
+  const safeTools = filterSafeBrowseTools(tools);
+
   throwIfAborted(signal);
-  if (!cwd || tools.length === 0) return [];
+  if (!cwd || safeTools.length === 0) return [];
 
   const authStorage = AuthStorage.inMemory();
   authStorage.setRuntimeApiKey(model.provider, apiKey);
@@ -91,24 +107,27 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
     authStorage,
     modelRegistry,
     resourceLoader: loader,
-    tools,
+    tools: safeTools,
     sessionManager: SessionManager.inMemory(cwd),
     settingsManager,
   });
-  throwIfAborted(signal);
 
-  const unsubscribe = session.subscribe((event) => {
-    if (event.type === "tool_execution_start") {
-      onProgress?.(describeToolExecution(event.toolName, event.args));
-    }
-  });
-
+  let unsubscribe = () => {};
   const abort = () => {
     void session.abort();
   };
   signal?.addEventListener("abort", abort, { once: true });
 
   try {
+    if (signal?.aborted) abort();
+    throwIfAborted(signal);
+
+    unsubscribe = session.subscribe((event) => {
+      if (event.type === "tool_execution_start") {
+        onProgress?.(describeToolExecution(event.toolName, event.args));
+      }
+    });
+
     onProgress?.("Examining codebase…");
     await session.prompt(buildBrowseUserPrompt(input, maxRefs));
     throwIfAborted(signal);
@@ -133,7 +152,7 @@ function buildBrowseSystemPrompt(maxRefs: number): string {
     "",
     "Return ONLY JSON in this shape:",
     '{"refs":[{"path":"src/file.ts","score":97,"isEntrypoint":false}]}',
-    `Return at most ${Math.max(1, maxRefs)} refs.`,
+    `Return at most ${maxRefs} refs.`,
     "Never invent paths. Only return files you actually inspected or directly inferred from inspected code and tool results.",
   ].join("\n");
 }
@@ -143,7 +162,7 @@ function buildBrowseUserPrompt(input: string, maxRefs: number): string {
     "Task to prepare for:",
     input,
     "",
-    `Browse the codebase and return at most ${Math.max(1, maxRefs)} file refs that would best ground a later prompt rewrite.`,
+    `Browse the codebase and return at most ${maxRefs} file refs that would best ground a later prompt rewrite.`,
     "Prefer entry points, primary implementation files, and the smallest useful support files.",
   ].join("\n");
 }
@@ -198,12 +217,13 @@ function parseRefs(content: string): ParsedRef[] {
 async function sanitizeRefs(parsedRefs: ParsedRef[], cwd: string, maxRefs: number): Promise<Ref[]> {
   const refs: Ref[] = [];
   const seen = new Set<string>();
-  const limit = Math.max(1, maxRefs);
+  const limit = normalizeMaxRefs(maxRefs);
+  const canonicalCwd = await realpath(cwd);
 
   for (const parsedRef of parsedRefs) {
     if (refs.length >= limit) break;
 
-    const path = await normalizeRepoRelativePath(cwd, parsedRef.path);
+    const path = await normalizeRepoRelativePath(canonicalCwd, parsedRef.path);
     if (!path || seen.has(path)) continue;
 
     seen.add(path);
@@ -217,22 +237,25 @@ async function sanitizeRefs(parsedRefs: ParsedRef[], cwd: string, maxRefs: numbe
   return refs;
 }
 
-async function normalizeRepoRelativePath(cwd: string, rawPath: string): Promise<string | undefined> {
+async function normalizeRepoRelativePath(canonicalCwd: string, rawPath: string): Promise<string | undefined> {
   const trimmed = rawPath.trim();
   if (!trimmed || trimmed.includes("\0")) return undefined;
 
-  const resolved = isAbsolute(trimmed)
+  const requestedPath = isAbsolute(trimmed)
     ? resolve(trimmed)
-    : resolve(cwd, trimmed);
-  const relativePath = relative(cwd, resolved);
-  if (!relativePath || relativePath === "." || relativePath.startsWith(`..${sep}`) || relativePath === ".." || isAbsolute(relativePath)) {
+    : resolve(canonicalCwd, trimmed);
+
+  let canonicalPath: string;
+  try {
+    canonicalPath = await realpath(requestedPath);
+    const stats = await stat(canonicalPath);
+    if (!stats.isFile()) return undefined;
+  } catch {
     return undefined;
   }
 
-  try {
-    const stats = await stat(resolved);
-    if (!stats.isFile()) return undefined;
-  } catch {
+  const relativePath = relative(canonicalCwd, canonicalPath);
+  if (!relativePath || relativePath === "." || relativePath.startsWith(`..${sep}`) || relativePath === ".." || isAbsolute(relativePath)) {
     return undefined;
   }
 
@@ -273,10 +296,6 @@ function describeToolExecution(toolName: string, args: unknown): string {
       return `Listing ${readStringArg(args, "path") ?? "directories"}…`;
     case "code_search":
       return "Searching code/docs…";
-    case "web_search":
-      return "Searching the web/docs…";
-    case "fetch_content":
-      return "Fetching documentation content…";
     case "project_memory_search":
       return "Searching project memory…";
     case "project_memory_read":
@@ -294,6 +313,24 @@ function readStringArg(args: unknown, key: string): string | undefined {
   if (!args || typeof args !== "object") return undefined;
   const value = (args as Record<string, unknown>)[key];
   return typeof value === "string" && value.trim() ? value.trim() : undefined;
+}
+
+function filterSafeBrowseTools(tools: string[]): string[] {
+  const seen = new Set<string>();
+  const safeTools: string[] = [];
+
+  for (const tool of tools) {
+    if (!SAFE_BROWSE_TOOL_NAMES.has(tool) || seen.has(tool)) continue;
+    seen.add(tool);
+    safeTools.push(tool);
+  }
+
+  return safeTools;
+}
+
+function normalizeMaxRefs(maxRefs: number): number {
+  if (!Number.isFinite(maxRefs)) return DEFAULT_MAX_REFS;
+  return Math.max(1, Math.floor(maxRefs));
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

@@ -6,25 +6,10 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { browseCodebase } from "../src/browse-pass.js";
+import { browseCodebase, SAFE_BROWSE_TOOL_NAMES } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
 import { PromptGenModal } from "../src/modal.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
-
-const SAFE_BROWSE_TOOL_NAMES = new Set([
-  "read",
-  "grep",
-  "find",
-  "ls",
-  "code_search",
-  "web_search",
-  "fetch_content",
-  "project_memory_read",
-  "project_memory_search",
-  "codegraph_explore",
-  "codegraph_node",
-  "codegraph_status",
-]);
 
 interface ResolvedEnhanceConfig {
   model: NonNullable<ExtensionCommandContext["model"]>;
@@ -110,13 +95,14 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       const initialText = resolveShortcutPrefill(ctx);
       const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
       const initialTextLabel = resolveShortcutPrefillLabel(ctx);
-      const enhanceConfig = await resolveEnhanceConfig(ctx as ExtensionCommandContext);
-      if (!enhanceConfig) return;
 
       if (ctx.mode !== "tui") {
         ctx.ui.notify("The global pi-prompt-gen shortcut is available in Pi TUI mode only.", "warning");
         return;
       }
+
+      const enhanceConfig = await resolveEnhanceConfig(ctx as ExtensionCommandContext);
+      if (!enhanceConfig) return;
 
       const enhanceFn = createEnhanceFn(ctx as ExtensionCommandContext, enhanceConfig, resolveBrowseToolNames(pi));
       const modal = new PromptGenModal({

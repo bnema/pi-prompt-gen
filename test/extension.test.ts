@@ -8,6 +8,18 @@ import type { Model, Api } from "@earendil-works/pi-ai";
 
 const mockEnhancePrompt = vi.fn();
 const mockBrowseCodebase = vi.fn();
+const mockSafeBrowseToolNames = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "code_search",
+  "project_memory_read",
+  "project_memory_search",
+  "codegraph_explore",
+  "codegraph_node",
+  "codegraph_status",
+]);
 
 vi.mock("../src/index.js", () => ({
   enhancePrompt: mockEnhancePrompt,
@@ -15,6 +27,7 @@ vi.mock("../src/index.js", () => ({
 
 vi.mock("../src/browse-pass.js", () => ({
   browseCodebase: mockBrowseCodebase,
+  SAFE_BROWSE_TOOL_NAMES: mockSafeBrowseToolNames,
 }));
 
 vi.mock("../src/modal.js", () => ({
@@ -137,7 +150,13 @@ function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
       { name: "find" },
       { name: "ls" },
       { name: "code_search" },
+      { name: "project_memory_read" },
+      { name: "project_memory_search" },
+      { name: "codegraph_explore" },
+      { name: "codegraph_node" },
+      { name: "codegraph_status" },
       { name: "web_search" },
+      { name: "fetch_content" },
       { name: "write" },
     ]),
     setActiveTools: vi.fn(),
@@ -186,6 +205,29 @@ describe("Extension registration", () => {
     await shortcut.handler(ctx);
 
     expect(ctx.ui.custom).toHaveBeenCalledTimes(1);
+  });
+
+  it("rejects the global shortcut in non-TUI mode before resolving model auth", async () => {
+    const getApiKeyAndHeaders = vi.fn().mockResolvedValue({ ok: false, error: "should not run" });
+    const ctx = makeMockContext({
+      mode: "print",
+      waitForIdle: undefined as any,
+      modelRegistry: {
+        ...makeMockContext().modelRegistry,
+        getApiKeyAndHeaders,
+      } as any,
+    });
+    const pi = makeExtensionAPI();
+    registerPiPromptGen(pi);
+
+    const shortcut = (pi.registerShortcut as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await shortcut.handler(ctx);
+
+    expect(getApiKeyAndHeaders).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "The global pi-prompt-gen shortcut is available in Pi TUI mode only.",
+      "warning",
+    );
   });
 });
 
@@ -418,7 +460,7 @@ describe("Command handler — enhance function wrapper", () => {
       model: ctx.model,
       apiKey: "sk-test",
       headers: undefined,
-      tools: ["read", "grep", "find", "ls", "code_search", "web_search"],
+      tools: ["read", "grep", "find", "ls", "code_search", "project_memory_read", "project_memory_search", "codegraph_explore", "codegraph_node", "codegraph_status"],
     }));
 
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
@@ -451,7 +493,7 @@ describe("Command handler — enhance function wrapper", () => {
     }));
   });
 
-  it("filters session-coupled tools out of the browse allowlist", async () => {
+  it("filters session-coupled and network-capable tools out of the browse allowlist", async () => {
     const ctx = makeMockContext({ cwd: "/my/project" });
     const pi = makeExtensionAPI({
       getAllTools: vi.fn().mockReturnValue([
@@ -460,6 +502,7 @@ describe("Command handler — enhance function wrapper", () => {
         { name: "editor_context" },
         { name: "code_search" },
         { name: "web_search" },
+        { name: "fetch_content" },
       ]),
     });
 
@@ -471,7 +514,7 @@ describe("Command handler — enhance function wrapper", () => {
     await modalOptions.enhanceFn("my text", "generate");
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
-      tools: ["read", "code_search", "web_search"],
+      tools: ["read", "code_search"],
     }));
   });
 
