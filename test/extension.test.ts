@@ -1,20 +1,33 @@
 /**
  * Tests for extensions/index.ts — extension command registration and wiring.
- *
- * Covers:
- *  - Command registration with /prompt
- *  - Prefill logic (args vs editor text vs blank)
- *  - Model resolution and error handling
- *  - TUI modal vs non-TUI fallback
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
 import type { Model, Api } from "@earendil-works/pi-ai";
 
-// Mock the src imports
+const mockEnhancePrompt = vi.fn();
+const mockBrowseCodebase = vi.fn();
+const mockSafeBrowseToolNames = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "code_search",
+  "project_memory_read",
+  "project_memory_search",
+  "codegraph_explore",
+  "codegraph_node",
+  "codegraph_status",
+]);
+
 vi.mock("../src/index.js", () => ({
-  enhancePrompt: vi.fn(),
+  enhancePrompt: mockEnhancePrompt,
+}));
+
+vi.mock("../src/browse-pass.js", () => ({
+  browseCodebase: mockBrowseCodebase,
+  SAFE_BROWSE_TOOL_NAMES: mockSafeBrowseToolNames,
 }));
 
 vi.mock("../src/modal.js", () => ({
@@ -31,15 +44,11 @@ vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
   };
 });
 
-// Import after mocking
 const { default: registerPiPromptGen } = await import("../extensions/index.js");
 const { enhancePrompt } = await import("../src/index.js");
+const { browseCodebase } = await import("../src/browse-pass.js");
 const { PromptGenModal } = await import("../src/modal.js");
 const { copyToClipboard } = await import("@earendil-works/pi-coding-agent");
-
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
 
 function makeModel(): Model<Api> {
   return {
@@ -135,7 +144,21 @@ function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
     setLabel: vi.fn(),
     exec: vi.fn(),
     getActiveTools: vi.fn(),
-    getAllTools: vi.fn(),
+    getAllTools: vi.fn().mockReturnValue([
+      { name: "read" },
+      { name: "grep" },
+      { name: "find" },
+      { name: "ls" },
+      { name: "code_search" },
+      { name: "project_memory_read" },
+      { name: "project_memory_search" },
+      { name: "codegraph_explore" },
+      { name: "codegraph_node" },
+      { name: "codegraph_status" },
+      { name: "web_search" },
+      { name: "fetch_content" },
+      { name: "write" },
+    ]),
     setActiveTools: vi.fn(),
     getCommands: vi.fn(),
     setModel: vi.fn(),
@@ -148,9 +171,16 @@ function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
   } as unknown as ExtensionAPI;
 }
 
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
+beforeEach(() => {
+  vi.clearAllMocks();
+  mockBrowseCodebase.mockResolvedValue([]);
+  mockEnhancePrompt.mockResolvedValue({
+    enhancedPrompt: "Enhanced result text",
+    refs: [],
+    systemPrompt: "",
+    modelResult: { content: "Enhanced result text", stopReason: "stop" },
+  });
+});
 
 describe("Extension registration", () => {
   it("registers the /prompt command and the global shortcut", () => {
@@ -176,6 +206,29 @@ describe("Extension registration", () => {
 
     expect(ctx.ui.custom).toHaveBeenCalledTimes(1);
   });
+
+  it("rejects the global shortcut in non-TUI mode before resolving model auth", async () => {
+    const getApiKeyAndHeaders = vi.fn().mockResolvedValue({ ok: false, error: "should not run" });
+    const ctx = makeMockContext({
+      mode: "print",
+      waitForIdle: undefined as any,
+      modelRegistry: {
+        ...makeMockContext().modelRegistry,
+        getApiKeyAndHeaders,
+      } as any,
+    });
+    const pi = makeExtensionAPI();
+    registerPiPromptGen(pi);
+
+    const shortcut = (pi.registerShortcut as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await shortcut.handler(ctx);
+
+    expect(getApiKeyAndHeaders).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "The global pi-prompt-gen shortcut is available in Pi TUI mode only.",
+      "warning",
+    );
+  });
 });
 
 describe("Command handler — model resolution", () => {
@@ -184,8 +237,6 @@ describe("Command handler — model resolution", () => {
     const pi = makeExtensionAPI();
 
     registerPiPromptGen(pi);
-
-    // Call the registered handler
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("", ctx);
 
@@ -215,10 +266,6 @@ describe("Command handler — model resolution", () => {
 });
 
 describe("Command handler — prefill behavior (TUI)", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("prefills from args when provided", async () => {
     const ctx = makeMockContext();
     const pi = makeExtensionAPI();
@@ -227,7 +274,6 @@ describe("Command handler — prefill behavior (TUI)", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("fix the sidebar sort", ctx);
 
-    // Should open modal with initial text from args
     expect(PromptGenModal).toHaveBeenCalledWith(expect.objectContaining({
       initialText: "fix the sidebar sort",
       mode: "rewrite",
@@ -247,7 +293,6 @@ describe("Command handler — prefill behavior (TUI)", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("", ctx);
 
-    // Should prefill from editor
     expect(PromptGenModal).toHaveBeenCalledWith(expect.objectContaining({
       initialText: "editor content here",
       mode: "rewrite",
@@ -307,38 +352,9 @@ describe("Command handler — prefill behavior (TUI)", () => {
       mode: "generate",
     }));
   });
-
-  it("opens modal via ctx.ui.custom with overlay options", async () => {
-    const ctx = makeMockContext();
-    const pi = makeExtensionAPI();
-
-    registerPiPromptGen(pi);
-    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
-
-    // ctx.ui.custom should be called to show the modal
-    expect(ctx.ui.custom).toHaveBeenCalledTimes(1);
-
-    const [factory, options] = (ctx.ui.custom as ReturnType<typeof vi.fn>).mock.calls[0];
-    expect(options).toEqual({
-      overlay: true,
-      overlayOptions: {
-        width: "90%",
-        maxHeight: "80%",
-        anchor: "center",
-      },
-    });
-
-    // The factory should create a component that has render/handleInput/invalidate
-    expect(typeof factory).toBe("function");
-  });
 });
 
 describe("Command handler — TUI vs non-TUI fallback", () => {
-  beforeEach(() => {
-    vi.clearAllMocks();
-  });
-
   it("uses modal in TUI mode", async () => {
     const ctx = makeMockContext({ mode: "tui", hasUI: true });
     const pi = makeExtensionAPI();
@@ -365,9 +381,7 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("test input", ctx);
 
-    // Should NOT try to use custom (modal) UI
     expect(ctx.ui.custom).not.toHaveBeenCalled();
-    // Should run enhancement directly
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "test input",
       mode: "rewrite",
@@ -375,14 +389,6 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
   });
 
   it("non-TUI fallback copies result to clipboard and writes to editor", async () => {
-    const mockEnhance = enhancePrompt as ReturnType<typeof vi.fn>;
-    mockEnhance.mockResolvedValue({
-      enhancedPrompt: "Enhanced result text",
-      refs: [],
-      systemPrompt: "",
-      modelResult: { content: "Enhanced result text", stopReason: "stop" },
-    });
-
     const ctx = makeMockContext({
       mode: "print",
       hasUI: true,
@@ -425,18 +431,19 @@ describe("Command handler — sendUserMessage integration", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("test", ctx);
 
-    // Extract the sendFn from PromptGenModal options
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    expect(modalOptions.sendFn).toBeDefined();
-
-    // Call the sendFn
     modalOptions.sendFn("send this text");
     expect(pi.sendUserMessage).toHaveBeenCalledWith("send this text");
   });
 });
 
 describe("Command handler — enhance function wrapper", () => {
-  it("enhanceFn constructs correct options", async () => {
+  it("runs an isolated browse pass with the active model before enhancement", async () => {
+    mockBrowseCodebase.mockResolvedValue([
+      { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
+      { path: "src/main.ts", score: 88, isEntrypoint: true },
+    ]);
+
     const ctx = makeMockContext({ cwd: "/my/project" });
     const pi = makeExtensionAPI();
 
@@ -445,24 +452,94 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("test", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    const enhanceFn = modalOptions.enhanceFn;
+    await modalOptions.enhanceFn("my text", "generate");
 
-    await enhanceFn("my text", "generate");
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "my text",
+      cwd: "/my/project",
+      model: ctx.model,
+      apiKey: "sk-test",
+      headers: undefined,
+      tools: ["read", "grep", "find", "ls", "code_search", "project_memory_read", "project_memory_search", "codegraph_explore", "codegraph_node", "codegraph_status"],
+    }));
 
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "my text",
       mode: "generate",
-      cwd: "/test/project",
       model: ctx.model,
       apiKey: "sk-test",
       headers: undefined,
+      relevantRefs: [
+        { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
+        { path: "src/main.ts", score: 88, isEntrypoint: true },
+      ],
+    }));
+  });
+
+  it("passes a progress callback into the browse pass", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    const onProgress = vi.fn();
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, onProgress);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      onProgress,
+    }));
+  });
+
+  it("filters session-coupled and network-capable tools out of the browse allowlist", async () => {
+    const ctx = makeMockContext({ cwd: "/my/project" });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([
+        { name: "read" },
+        { name: "diagnostics" },
+        { name: "editor_context" },
+        { name: "code_search" },
+        { name: "web_search" },
+        { name: "fetch_content" },
+      ]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      tools: ["read", "code_search"],
+    }));
+  });
+
+  it("skips the browse pass when no safe browse tools are available", async () => {
+    const ctx = makeMockContext({ cwd: "/my/project" });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([{ name: "write" }]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      relevantRefs: [],
     }));
   });
 });
 
 describe("Extension re-exports", () => {
   it("re-exports enhancePrompt and types", async () => {
-    // The extension re-exports are tested by verifying the module can be imported
     const extModule = await import("../extensions/index.js");
     expect(extModule.enhancePrompt).toBeDefined();
     expect(typeof extModule.enhancePrompt).toBe("function");

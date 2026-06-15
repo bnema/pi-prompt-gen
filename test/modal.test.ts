@@ -137,6 +137,17 @@ describe("PromptGenModal construction", () => {
     expect(joined).toContain("generate");
   });
 
+  it("does not show the blank prefill label in the header", () => {
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "",
+      initialTextLabel: "blank",
+      mode: "generate",
+    }));
+    bindModal(modal);
+
+    expect(modal.render(80).join("\n")).not.toContain("(blank)");
+  });
+
   it("auto-detects rewrite when initialText is non-empty", () => {
     // Mode auto-detection logic is in PromptGenModal constructor:
     // mode = options.mode ?? (draft.trim() ? "rewrite" : "generate")
@@ -241,7 +252,7 @@ describe("PromptGenModal text editing", () => {
 
     // The enhanceFn should have been called
     expect(enhanceFn).toHaveBeenCalledTimes(1);
-    expect(enhanceFn).toHaveBeenCalledWith("test", "rewrite", expect.any(AbortSignal), undefined);
+    expect(enhanceFn).toHaveBeenCalledWith("test", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function));
   });
 
   it("handles arrow key navigation", () => {
@@ -329,7 +340,7 @@ describe("PromptGenModal enhancement lifecycle", () => {
     await vi.runAllTimersAsync();
     await vi.waitFor(() => {
       expect(enhanceFn).toHaveBeenCalledTimes(1);
-      expect(enhanceFn).toHaveBeenCalledWith("fix the sort", "rewrite", expect.any(AbortSignal), undefined);
+      expect(enhanceFn).toHaveBeenCalledWith("fix the sort", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function));
       expect(onEnhanceResult).toHaveBeenCalled();
     });
 
@@ -364,6 +375,143 @@ describe("PromptGenModal enhancement lifecycle", () => {
     // After resolution, status should be 'enhanced'
     const lines = modal.render(80);
     expect(lines.join("\n")).toContain("enhanced");
+  });
+
+  it("animates a spinner while enhancement is running", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockReturnValue(new Promise<EnhancePromptResult>((resolve) => {
+      resolvePromise = resolve;
+    }));
+    const renderSpy = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, renderSpy);
+
+    press(modal, "\r");
+
+    const firstRender = modal.render(80).join("\n");
+    const initialRenderCalls = renderSpy.mock.calls.length;
+
+    await vi.advanceTimersByTimeAsync(150);
+
+    const secondRender = modal.render(80).join("\n");
+    expect(renderSpy.mock.calls.length).toBeGreaterThan(initialRenderCalls);
+    expect(secondRender).not.toBe(firstRender);
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+  });
+
+  it("shows browse progress lines while examining the codebase", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      onProgress?.("Examining codebase…");
+      onProgress?.("Reading src/index.ts…");
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("Examining codebase…");
+    expect(joined).toContain("Reading src/index.ts…");
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+  });
+
+  it("normalizes multiline progress messages to a single rendered line", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      onProgress?.("Reading src/index.ts…\nextra detail");
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("Reading src/index.ts… extra detail");
+    expect(joined).not.toContain("Reading src/index.ts…\nextra detail");
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+  });
+
+  it("ignores late progress updates after the request is aborted", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    let progress!: (message: string) => void;
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      progress = onProgress!;
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    progress("Reading src/index.ts…");
+    expect(modal.render(80).join("\n")).toContain("Reading src/index.ts…");
+
+    press(modal, "\u001b");
+    progress("Stale progress should be ignored");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("cancelled");
+    expect(joined).not.toContain("Stale progress should be ignored");
+
+    resolvePromise(makeEnhanceResult());
+    await Promise.resolve();
+  });
+
+  it("replaces stale progress lines when a new enhancement run starts", async () => {
+    const progressCallbacks: Array<(message: string) => void> = [];
+    const resolvers: Array<(val: EnhancePromptResult) => void> = [];
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      progressCallbacks.push(onProgress!);
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvers.push(resolve);
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    progressCallbacks[0]!("Reading old-file.ts…");
+    press(modal, "\u001b");
+
+    press(modal, "\r");
+    progressCallbacks[1]!("Reading fresh-file.ts…");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("Reading fresh-file.ts…");
+    expect(joined).not.toContain("Reading old-file.ts…");
+
+    resolvers[0]!(makeEnhanceResult());
+    resolvers[1]!(makeEnhanceResult());
+    await Promise.resolve();
   });
 
   it("handles enhancement errors gracefully", async () => {
@@ -556,6 +704,7 @@ describe("PromptGenModal regenerate/alternative", () => {
         "rewrite",
         expect.any(AbortSignal),
         "Enhanced: fix the sidebar sort order to use `createdAt` descending.",
+        expect.any(Function),
       );
     });
   });
