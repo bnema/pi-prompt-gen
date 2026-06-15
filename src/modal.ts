@@ -251,7 +251,6 @@ export class PromptGenModal implements TuiComponent {
   private activeAbort: AbortController | undefined;
   private spinnerFrameIndex = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
-  private progressMessage = "";
   private progressLog: string[] = [];
 
   // ---- injected ----
@@ -318,7 +317,7 @@ export class PromptGenModal implements TuiComponent {
       ? dim(` (${this.initialTextLabel})`, this.theme)
       : "";
     const modeDisplay = this.status === "enhancing"
-      ? accent(`[${modeLabel}]`, this.theme) + " " + accent(this.currentSpinnerFrame(), this.theme) + " " + dim(this.progressMessage || "enhancing\u2026", this.theme) + prefillInfo
+      ? accent(`[${modeLabel}]`, this.theme) + " " + accent(this.currentSpinnerFrame(), this.theme) + " " + dim(this.progressLog[this.progressLog.length - 1] || "enhancing\u2026", this.theme) + prefillInfo
       : accent(`[${modeLabel}]`, this.theme) + " " + dim(this.statusDisplay(), this.theme) + prefillInfo;
     lines.push(modeDisplay + "  " + dim(modeHint, this.theme) + " ".repeat(Math.max(0, inner - visibleWidth(modeDisplay) - 2 - visibleWidth(modeHint))));
 
@@ -714,8 +713,7 @@ export class PromptGenModal implements TuiComponent {
   private toggleMode(): void {
     this.mode = this.mode === "rewrite" ? "generate" : "rewrite";
     this.result = undefined;
-    this.progressMessage = "";
-    this.progressLog = [];
+    this.resetProgress();
     this.setStatus("idle", `switched to ${this.mode}`);
   }
 
@@ -724,8 +722,7 @@ export class PromptGenModal implements TuiComponent {
     this.cursor = 0;
     this.draftScroll = 0;
     this.result = undefined;
-    this.progressMessage = "";
-    this.progressLog = [];
+    this.resetProgress();
     this.setStatus("idle", "draft cleared");
     // Switch to generate mode when draft is cleared
     if (this.mode === "rewrite") {
@@ -744,8 +741,7 @@ export class PromptGenModal implements TuiComponent {
     const controller = new AbortController();
     const previousOutput = regenerate ? this.result?.enhancedPrompt : undefined;
     this.activeAbort = controller;
-    this.progressMessage = "Examining codebase…";
-    this.progressLog = ["Examining codebase…"];
+    this.resetProgress();
     this.setStatus("enhancing", "enhancing…");
     this.result = undefined;
     this.requestRender();
@@ -758,11 +754,7 @@ export class PromptGenModal implements TuiComponent {
         previousOutput,
         (message: string) => {
           if (!message || requestId !== this.requestVersion || controller.signal.aborted) return;
-          this.progressMessage = message;
-          if (this.progressLog[this.progressLog.length - 1] !== message) {
-            this.progressLog.push(message);
-            if (this.progressLog.length > MAX_PREVIEW_HEIGHT) this.progressLog.shift();
-          }
+          this.pushProgress(message);
           this.requestRender();
         },
       );
@@ -838,9 +830,18 @@ export class PromptGenModal implements TuiComponent {
   private invalidateEnhancedResult(message: string): void {
     if (!this.result && this.status !== "enhanced") return;
     this.result = undefined;
-    this.progressMessage = "";
-    this.progressLog = [];
+    this.resetProgress();
     this.setStatus("idle", message);
+  }
+
+  private resetProgress(): void {
+    this.progressLog = [];
+  }
+
+  private pushProgress(message: string): void {
+    if (this.progressLog[this.progressLog.length - 1] === message) return;
+    this.progressLog.push(message);
+    if (this.progressLog.length > MAX_PREVIEW_HEIGHT) this.progressLog.shift();
   }
 
   private statusDisplay(): string {

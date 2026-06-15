@@ -429,6 +429,67 @@ describe("PromptGenModal enhancement lifecycle", () => {
     await vi.runAllTimersAsync();
   });
 
+  it("ignores late progress updates after the request is aborted", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    let progress!: (message: string) => void;
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      progress = onProgress!;
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    progress("Reading src/index.ts…");
+    expect(modal.render(80).join("\n")).toContain("Reading src/index.ts…");
+
+    press(modal, "\u001b");
+    progress("Stale progress should be ignored");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("cancelled");
+    expect(joined).not.toContain("Stale progress should be ignored");
+
+    resolvePromise(makeEnhanceResult());
+    await Promise.resolve();
+  });
+
+  it("replaces stale progress lines when a new enhancement run starts", async () => {
+    const progressCallbacks: Array<(message: string) => void> = [];
+    const resolvers: Array<(val: EnhancePromptResult) => void> = [];
+    const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {
+      progressCallbacks.push(onProgress!);
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvers.push(resolve);
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    progressCallbacks[0]!("Reading old-file.ts…");
+    press(modal, "\u001b");
+
+    press(modal, "\r");
+    progressCallbacks[1]!("Reading fresh-file.ts…");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("Reading fresh-file.ts…");
+    expect(joined).not.toContain("Reading old-file.ts…");
+
+    resolvers[0]!(makeEnhanceResult());
+    resolvers[1]!(makeEnhanceResult());
+    await Promise.resolve();
+  });
+
   it("handles enhancement errors gracefully", async () => {
     const enhanceFn = vi.fn().mockRejectedValue(new Error("API error"));
     const notifyFn = vi.fn();

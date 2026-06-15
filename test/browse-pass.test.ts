@@ -2,7 +2,10 @@
  * Tests for browse-pass.ts — isolated read-only browse session setup.
  */
 
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { tmpdir } from "node:os";
+import { dirname, join } from "node:path";
 import type { Api, Model } from "@earendil-works/pi-ai";
 
 const mockSetRuntimeApiKey = vi.fn();
@@ -11,27 +14,24 @@ const mockReload = vi.fn().mockResolvedValue(undefined);
 const mockAbort = vi.fn().mockResolvedValue(undefined);
 const mockDispose = vi.fn();
 const mockPrompt = vi.fn().mockResolvedValue(undefined);
-const mockSubscribe = vi.fn(() => vi.fn());
+const mockUnsubscribe = vi.fn();
+const loaderOptions: unknown[] = [];
+
+let toolEventListener: ((event: { type: string; toolName: string; args?: unknown }) => void) | undefined;
+
+const mockSession = {
+  subscribe: vi.fn((listener: typeof toolEventListener) => {
+    toolEventListener = listener;
+    return mockUnsubscribe;
+  }),
+  prompt: mockPrompt,
+  abort: mockAbort,
+  dispose: mockDispose,
+  messages: [] as Array<{ role: string; content: Array<{ type: string; text: string }> }>,
+};
+
 const mockCreateAgentSession = vi.fn(async () => ({
-  session: {
-    subscribe: mockSubscribe,
-    prompt: mockPrompt,
-    abort: mockAbort,
-    dispose: mockDispose,
-    messages: [
-      {
-        role: "assistant",
-        content: [
-          {
-            type: "text",
-            text: JSON.stringify({
-              refs: [{ path: "src/index.ts", score: 97, isEntrypoint: true }],
-            }),
-          },
-        ],
-      },
-    ],
-  },
+  session: mockSession,
 }));
 
 vi.mock("@earendil-works/pi-coding-agent", () => ({
@@ -51,7 +51,8 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
       set: vi.fn(),
     })),
   },
-  DefaultResourceLoader: vi.fn().mockImplementation(function DefaultResourceLoaderMock() {
+  DefaultResourceLoader: vi.fn().mockImplementation(function DefaultResourceLoaderMock(options: unknown) {
+    loaderOptions.push(options);
     return {
       reload: mockReload,
     };
@@ -83,6 +84,19 @@ function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   };
 }
 
+const tempDirs: string[] = [];
+
+async function makeRepo(files: Record<string, string>): Promise<string> {
+  const root = await mkdtemp(join(tmpdir(), "pi-prompt-gen-browse-"));
+  tempDirs.push(root);
+  for (const [relativePath, content] of Object.entries(files)) {
+    const fullPath = join(root, relativePath);
+    await mkdir(dirname(fullPath), { recursive: true });
+    await writeFile(fullPath, content);
+  }
+  return root;
+}
+
 describe("browseCodebase", () => {
   beforeEach(() => {
     mockSetRuntimeApiKey.mockReset();
@@ -92,24 +106,190 @@ describe("browseCodebase", () => {
     mockDispose.mockReset();
     mockPrompt.mockReset();
     mockPrompt.mockResolvedValue(undefined);
-    mockSubscribe.mockClear();
+    mockUnsubscribe.mockReset();
+    mockSession.subscribe.mockClear();
     mockCreateAgentSession.mockClear();
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [{ path: "src/index.ts", score: 97, isEntrypoint: true }],
+            }),
+          },
+        ],
+      },
+    ];
+    toolEventListener = undefined;
+    loaderOptions.length = 0;
   });
 
-  it("creates the isolated browse session with thinking disabled", async () => {
+  afterEach(async () => {
+    await Promise.all(tempDirs.splice(0).map((dir) => rm(dir, { recursive: true, force: true })));
+  });
+
+  it("creates the isolated browse session with extensions and context files disabled", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+
     const refs = await browseCodebase({
       input: "fix sidebar sorting",
-      cwd: "/repo",
+      cwd: repo,
       model: makeModel(),
       apiKey: "sk-test",
       tools: ["read", "grep"],
     });
 
+    expect(loaderOptions[0]).toEqual(expect.objectContaining({
+      noPromptTemplates: true,
+      noThemes: true,
+      noSkills: true,
+      noExtensions: true,
+      noContextFiles: true,
+    }));
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       thinkingLevel: "off",
     }));
     expect(refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
+  });
+
+  it("keeps only safe repo-relative refs that exist under cwd", async () => {
+    const repo = await makeRepo({
+      "src/index.ts": "export const ok = true;",
+      "src/other.ts": "export const other = true;",
+    });
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [
+                { path: "src/index.ts", score: 97, isEntrypoint: true },
+                { path: "./src/other.ts", score: "bad", isEntrypoint: false },
+                { path: "/etc/passwd", score: 99, isEntrypoint: false },
+                { path: "../outside.ts", score: 75, isEntrypoint: false },
+                { path: "src/missing.ts", score: 88, isEntrypoint: false },
+                { path: "src/index.ts", score: 12, isEntrypoint: false },
+              ],
+            }),
+          },
+        ],
+      },
+    ];
+
+    const refs = await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+    });
+
+    expect(refs).toEqual([
+      { path: "src/index.ts", score: 97, isEntrypoint: true },
+      { path: "src/other.ts", score: 50, isEntrypoint: false },
+    ]);
+  });
+
+  it("reports tool progress and parses fenced JSON responses", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: [
+              "```json",
+              JSON.stringify({ refs: [{ path: "src/index.ts", score: 97, isEntrypoint: true }] }),
+              "```",
+            ].join("\n"),
+          },
+        ],
+      },
+    ];
+    mockPrompt.mockImplementation(async () => {
+      toolEventListener?.({ type: "tool_execution_start", toolName: "read", args: { path: "src/index.ts" } });
+    });
+
+    const onProgress = vi.fn();
+    const refs = await browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      onProgress,
+    });
+
+    expect(onProgress.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([
+      "Examining codebase…",
+      "Reading src/index.ts…",
+      "Selecting useful references…",
+    ]));
+    expect(refs).toEqual([
+      { path: "src/index.ts", score: 97, isEntrypoint: true },
+    ]);
+  });
+
+  it("fails fast when the signal is already aborted", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    const controller = new AbortController();
+    controller.abort();
+
+    await expect(browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      signal: controller.signal,
+    })).rejects.toThrow(/abort/i);
+
+    expect(mockReload).not.toHaveBeenCalled();
+    expect(mockCreateAgentSession).not.toHaveBeenCalled();
+  });
+
+  it("aborts the session and rejects when the signal aborts mid-prompt", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    const controller = new AbortController();
+
+    mockPrompt.mockImplementation(async () => {
+      controller.abort();
+    });
+
+    await expect(browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      signal: controller.signal,
+    })).rejects.toThrow(/abort/i);
+
+    expect(mockAbort).toHaveBeenCalledTimes(1);
+    expect(mockUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockDispose).toHaveBeenCalledTimes(1);
+  });
+
+  it("unsubscribes and disposes the temporary session when prompt fails", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    mockPrompt.mockRejectedValue(new Error("browse failed"));
+
+    await expect(browseCodebase({
+      input: "fix sidebar sorting",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+    })).rejects.toThrow("browse failed");
+
+    expect(mockUnsubscribe).toHaveBeenCalledTimes(1);
+    expect(mockDispose).toHaveBeenCalledTimes(1);
   });
 });

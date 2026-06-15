@@ -450,6 +450,49 @@ describe("Command handler — enhance function wrapper", () => {
       onProgress,
     }));
   });
+
+  it("filters session-coupled tools out of the browse allowlist", async () => {
+    const ctx = makeMockContext({ cwd: "/my/project" });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([
+        { name: "read" },
+        { name: "diagnostics" },
+        { name: "editor_context" },
+        { name: "code_search" },
+        { name: "web_search" },
+      ]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      tools: ["read", "code_search", "web_search"],
+    }));
+  });
+
+  it("skips the browse pass when no safe browse tools are available", async () => {
+    const ctx = makeMockContext({ cwd: "/my/project" });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([{ name: "write" }]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      relevantRefs: [],
+    }));
+  });
 });
 
 describe("Extension re-exports", () => {

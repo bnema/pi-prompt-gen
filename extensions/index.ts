@@ -21,8 +21,6 @@ const SAFE_BROWSE_TOOL_NAMES = new Set([
   "fetch_content",
   "project_memory_read",
   "project_memory_search",
-  "diagnostics",
-  "editor_context",
   "codegraph_explore",
   "codegraph_node",
   "codegraph_status",
@@ -49,7 +47,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     const enhanceFn = createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi));
 
     if (ctx.mode !== "tui") {
-      await runNonTuiFallback(ctx, initialText, initialMode, enhanceFn, pi, notify);
+      await runNonTuiFallback(ctx, initialText, initialMode, enhanceFn, notify);
       return;
     }
 
@@ -170,7 +168,9 @@ function createEnhanceFn(
     previousOutput?: string,
     onProgress?: (message: string) => void,
   ) => {
-    const refs = ctx.cwd
+    throwIfAborted(signal);
+
+    const refs = ctx.cwd && browseTools.length > 0
       ? await browseCodebase({
         input: text,
         cwd: ctx.cwd,
@@ -183,6 +183,7 @@ function createEnhanceFn(
       })
       : [];
 
+    throwIfAborted(signal);
     onProgress?.("Generating enhanced prompt…");
     return enhancePrompt({
       input: text,
@@ -221,6 +222,18 @@ async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<Resol
     apiKey: auth.apiKey ?? "",
     headers: auth.headers,
   };
+}
+
+function throwIfAborted(signal?: AbortSignal): void {
+  if (!signal?.aborted) return;
+
+  if (typeof DOMException === "function") {
+    throw new DOMException("Prompt enhancement aborted", "AbortError");
+  }
+
+  const error = new Error("Prompt enhancement aborted");
+  error.name = "AbortError";
+  throw error;
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +320,6 @@ async function runNonTuiFallback(
   initialText: string,
   initialMode: EnhancerMode,
   enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => ReturnType<typeof enhancePrompt>,
-  pi: ExtensionAPI,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
 ): Promise<void> {
   if (!ctx.hasUI) {
@@ -354,7 +366,6 @@ async function runNonTuiFallback(
       `Enhanced prompt copied to clipboard${ctx.hasUI ? " and written to editor" : ""}.`,
       "info",
     );
-    void pi;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
