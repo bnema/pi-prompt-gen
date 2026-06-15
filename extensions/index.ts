@@ -183,13 +183,13 @@ function createSendFn(
   ctx: Pick<ExtensionCommandContext, "ui">,
 ): (text: string) => Promise<void> {
   return async (text: string) => {
-    try {
-      pi.sendUserMessage(text);
-    } catch {
-      pi.sendUserMessage(text, { deliverAs: "followUp" });
-    }
+    pi.sendUserMessage(text);
 
-    ctx.ui.setEditorText("");
+    try {
+      ctx.ui.setEditorText("");
+    } catch {
+      ctx.ui.notify("Sent prompt, but failed to clear the editor.", "warning");
+    }
   };
 }
 

@@ -454,6 +454,31 @@ describe("Command handler — sendUserMessage integration", () => {
 
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("");
   });
+
+  it("modal sendFn treats editor clearing as best-effort after a successful send", async () => {
+    const pi = makeExtensionAPI();
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        setEditorText: vi.fn(() => {
+          throw new Error("clear failed");
+        }),
+      } as ExtensionUIContext,
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await expect(modalOptions.sendFn("send this text")).resolves.toBeUndefined();
+
+    expect(pi.sendUserMessage).toHaveBeenCalledWith("send this text");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Sent prompt, but failed to clear the editor.",
+      "warning",
+    );
+  });
 });
 
 describe("Command handler — enhance function wrapper", () => {

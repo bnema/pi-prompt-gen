@@ -457,6 +457,34 @@ describe("PromptGenModal enhancement lifecycle", () => {
     await vi.runAllTimersAsync();
   });
 
+  it("ignores bracketed paste while enhancement is in progress", async () => {
+    let resolvePromise!: (val: EnhancePromptResult) => void;
+    const enhanceFn = vi.fn().mockImplementation(async () => {
+      return await new Promise<EnhancePromptResult>((resolve) => {
+        resolvePromise = resolve;
+      });
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal, vi.fn());
+
+    press(modal, "\r");
+    press(modal, "\u001b[200~ + pasted while enhancing\u001b[201~");
+
+    const joinedWhileEnhancing = modal.render(80).join("\n");
+    expect(joinedWhileEnhancing).toContain("test");
+    expect(joinedWhileEnhancing).not.toContain("pasted while enhancing");
+
+    resolvePromise(makeEnhanceResult());
+    await vi.runAllTimersAsync();
+
+    const joinedAfter = modal.render(80).join("\n");
+    expect(joinedAfter).toContain("test");
+    expect(joinedAfter).not.toContain("pasted while enhancing");
+  });
+
   it("normalizes multiline progress messages to a single rendered line", async () => {
     let resolvePromise!: (val: EnhancePromptResult) => void;
     const enhanceFn = vi.fn().mockImplementation(async (_text, _mode, _signal, _previousOutput, onProgress) => {

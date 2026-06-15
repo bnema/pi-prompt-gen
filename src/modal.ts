@@ -443,16 +443,13 @@ export class PromptGenModal implements TuiComponent {
   // ---------------------------------------------------------------
 
   handleInput(data: string): void {
-    if (this.handleBracketedPasteInput(data)) {
-      return;
-    }
-
     // Always handle cancel/escape via injected keybindings when available.
     if (this.matchesAction(data, "tui.select.cancel", Key.escape)) {
       if (this.status === "enhancing") {
         this.requestVersion += 1;
         this.activeAbort?.abort();
         this.activeAbort = undefined;
+        this.resetPasteState();
         this.setStatus("idle", "cancelled");
         this.requestRender();
         return;
@@ -461,8 +458,18 @@ export class PromptGenModal implements TuiComponent {
       return;
     }
 
-    // Block other input during enhancement
-    if (this.status === "enhancing") return;
+    // Block other input during enhancement, including paste buffers, so a result
+    // cannot land for stale text after the visible draft has already changed.
+    if (this.status === "enhancing") {
+      if (this.isInPaste || data.includes("\x1b[200~")) {
+        this.resetPasteState();
+      }
+      return;
+    }
+
+    if (this.handleBracketedPasteInput(data)) {
+      return;
+    }
 
     // Alt shortcuts (must be checked before printable characters)
     // Alt+r regenerates / requests an alternative
@@ -619,6 +626,8 @@ export class PromptGenModal implements TuiComponent {
   }
 
   private handleBracketedPasteInput(data: string): boolean {
+    // Pi TUI re-wraps each completed paste into one bracketed-paste input chunk,
+    // so this modal only needs to handle whole-sequence paste events here.
     if (data.includes("\x1b[200~")) {
       this.isInPaste = true;
       this.pasteBuffer = "";
@@ -647,6 +656,11 @@ export class PromptGenModal implements TuiComponent {
     }
 
     return true;
+  }
+
+  private resetPasteState(): void {
+    this.isInPaste = false;
+    this.pasteBuffer = "";
   }
 
   private insertAtCursor(text: string): void {
