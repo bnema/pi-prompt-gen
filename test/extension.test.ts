@@ -266,7 +266,7 @@ describe("Command handler — model resolution", () => {
 });
 
 describe("Command handler — prefill behavior (TUI)", () => {
-  it("prefills from args when provided", async () => {
+  it("runs inline enhancement immediately when args are provided", async () => {
     const ctx = makeMockContext();
     const pi = makeExtensionAPI();
 
@@ -274,10 +274,14 @@ describe("Command handler — prefill behavior (TUI)", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("fix the sidebar sort", ctx);
 
-    expect(PromptGenModal).toHaveBeenCalledWith(expect.objectContaining({
-      initialText: "fix the sidebar sort",
+    expect(PromptGenModal).not.toHaveBeenCalled();
+    expect(ctx.ui.custom).not.toHaveBeenCalled();
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort",
       mode: "rewrite",
     }));
+    expect(copyToClipboard).toHaveBeenCalledWith("Enhanced result text");
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
   });
 
   it("prefills from editor text when no args and editor has text", async () => {
@@ -355,7 +359,24 @@ describe("Command handler — prefill behavior (TUI)", () => {
 });
 
 describe("Command handler — TUI vs non-TUI fallback", () => {
-  it("uses modal in TUI mode", async () => {
+  it("uses modal in TUI mode when no args are provided", async () => {
+    const ctx = makeMockContext({ mode: "tui", hasUI: true });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    expect(ctx.ui.custom).toHaveBeenCalled();
+  });
+
+  it("shows inline status progress while enhancing args", async () => {
+    mockBrowseCodebase.mockImplementation(async ({ onProgress }) => {
+      onProgress?.("Examining codebase…");
+      onProgress?.("Reading src/index.ts…");
+      return [];
+    });
+
     const ctx = makeMockContext({ mode: "tui", hasUI: true });
     const pi = makeExtensionAPI();
 
@@ -363,7 +384,15 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
     await command.handler("test", ctx);
 
-    expect(ctx.ui.custom).toHaveBeenCalled();
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "pi-prompt-gen",
+      expect.stringContaining("Examining codebase"),
+    );
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith(
+      "pi-prompt-gen",
+      expect.stringContaining("Reading src/index.ts"),
+    );
+    expect(ctx.ui.setStatus).toHaveBeenCalledWith("pi-prompt-gen", undefined);
   });
 
   it("uses non-TUI fallback when mode is not TUI", async () => {
@@ -407,6 +436,79 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     );
   });
 
+  it("warns specifically when inline clipboard copy fails after enhancement succeeds", async () => {
+    vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
+
+    const ctx = makeMockContext({
+      mode: "print",
+      hasUI: true,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test input", ctx);
+
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhanced prompt written to editor, but failed to copy to clipboard.",
+      "warning",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Enhancement failed"), "error");
+  });
+
+  it("warns specifically when inline editor write fails after enhancement succeeds", async () => {
+    const ctx = makeMockContext({
+      mode: "print",
+      hasUI: true,
+      ui: {
+        ...makeMockContext().ui,
+        setEditorText: vi.fn(() => {
+          throw new Error("editor failed");
+        }),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test input", ctx);
+
+    expect(copyToClipboard).toHaveBeenCalledWith("Enhanced result text");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhanced prompt ready, but failed to write to editor.",
+      "warning",
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Enhanced prompt copied to clipboard.", "info");
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Enhancement failed"), "error");
+  });
+
+  it("warns specifically when inline editor write and clipboard copy both fail", async () => {
+    vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
+
+    const ctx = makeMockContext({
+      mode: "print",
+      hasUI: true,
+      ui: {
+        ...makeMockContext().ui,
+        setEditorText: vi.fn(() => {
+          throw new Error("editor failed");
+        }),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test input", ctx);
+
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhanced prompt ready, but failed to write to editor or copy to clipboard.",
+      "warning",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Enhancement failed"), "error");
+  });
+
   it("throws an explicit error in no-UI contexts", async () => {
     const ctx = makeMockContext({
       mode: "print",
@@ -429,7 +531,7 @@ describe("Command handler — sendUserMessage integration", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.sendFn("send this text");
@@ -447,7 +549,7 @@ describe("Command handler — sendUserMessage integration", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.sendFn("send this text");
@@ -468,7 +570,7 @@ describe("Command handler — sendUserMessage integration", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await expect(modalOptions.sendFn("send this text")).resolves.toBeUndefined();
@@ -493,7 +595,7 @@ describe("Command handler — enhance function wrapper", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.enhanceFn("my text", "generate");
@@ -526,7 +628,7 @@ describe("Command handler — enhance function wrapper", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     const onProgress = vi.fn();
@@ -552,7 +654,7 @@ describe("Command handler — enhance function wrapper", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.enhanceFn("my text", "generate");
@@ -570,7 +672,7 @@ describe("Command handler — enhance function wrapper", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.enhanceFn("my text", "generate");

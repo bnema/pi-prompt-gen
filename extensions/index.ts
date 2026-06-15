@@ -1,7 +1,7 @@
 /**
  * pi-prompt-gen extension entry point.
  *
- * Registers the /prompt command that opens the modal prompt enhancer.
+ * Registers the /prompt command for modal or inline prompt enhancement.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -17,6 +17,24 @@ interface ResolvedEnhanceConfig {
   headers?: Record<string, string>;
 }
 
+type EnhanceFn = (
+  text: string,
+  mode: EnhancerMode,
+  signal?: AbortSignal,
+  previousOutput?: string,
+  onProgress?: (message: string) => void,
+) => ReturnType<typeof enhancePrompt>;
+
+const INLINE_STATUS_KEY = "pi-prompt-gen";
+const INLINE_STATUS_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const INLINE_STATUS_INTERVAL_MS = 120;
+const EDITOR_WRITE_WARNING = "Enhanced prompt ready, but failed to write to editor.";
+const EDITOR_AND_CLIPBOARD_WARNING = "Enhanced prompt ready, but failed to write to editor or copy to clipboard.";
+const CLIPBOARD_WRITE_WARNING = "Enhanced prompt written to editor, but failed to copy to clipboard.";
+const NO_UI_ERROR_MESSAGE =
+  "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
+  "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
+
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     await ctx.waitForIdle();
@@ -30,6 +48,11 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     if (!enhanceConfig) return;
 
     const enhanceFn = createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi));
+
+    if (args.trim()) {
+      await runInlineEnhancement(ctx, initialText, initialMode, enhanceFn, notify);
+      return;
+    }
 
     if (ctx.mode !== "tui") {
       await runNonTuiFallback(ctx, initialText, initialMode, enhanceFn, notify);
@@ -67,10 +90,10 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 
   pi.registerCommand("prompt", {
     description:
-      "Open the prompt enhancer modal. Rewrite an existing prompt or " +
-      "turn a rough idea into a polished prompt. " +
-      "Provide the prompt text as the command argument, or use the " +
-      "current editor/session text, or start blank.",
+      "Open the prompt enhancer modal, or run it inline when prompt text " +
+      "is provided as the command argument. Rewrite an existing prompt or " +
+      "turn a rough idea into a polished prompt. Use the current editor/" +
+      "session text when starting without args, or start blank.",
     handler: runPromptCommand,
   });
 
@@ -134,7 +157,7 @@ function createEnhanceFn(
   ctx: ExtensionCommandContext,
   config: ResolvedEnhanceConfig,
   browseTools: string[],
-): (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => ReturnType<typeof enhancePrompt> {
+): EnhanceFn {
   return async (
     text: string,
     mode: EnhancerMode,
@@ -308,14 +331,11 @@ async function runNonTuiFallback(
   ctx: ExtensionCommandContext,
   initialText: string,
   initialMode: EnhancerMode,
-  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => ReturnType<typeof enhancePrompt>,
+  enhanceFn: EnhanceFn,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
 ): Promise<void> {
   if (!ctx.hasUI) {
-    throw new Error(
-      "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
-        "Use Pi TUI for the modal, or provide text inside a UI-capable session.",
-    );
+    throw new Error(NO_UI_ERROR_MESSAGE);
   }
 
   const hasDialog = typeof ctx.ui.editor === "function";
@@ -341,24 +361,94 @@ async function runNonTuiFallback(
     return;
   }
 
+  await runInlineEnhancement(ctx, text, initialMode, enhanceFn, notify);
+}
+
+async function runInlineEnhancement(
+  ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">,
+  text: string,
+  mode: EnhancerMode,
+  enhanceFn: EnhanceFn,
+  notify: (msg: string, type?: "info" | "warning" | "error") => void,
+): Promise<void> {
+  if (!ctx.hasUI) {
+    throw new Error(NO_UI_ERROR_MESSAGE);
+  }
+
+  const progress = createInlineStatusReporter(ctx);
   notify("Enhancing prompt…", "info");
+
+  let output: string;
   try {
-    const result = await enhanceFn(text, initialMode);
-    const output = result.enhancedPrompt;
-
-    if (ctx.hasUI) {
-      ctx.ui.setEditorText(output);
-    }
-
-    await copyToClipboard(output);
-    notify(
-      `Enhanced prompt copied to clipboard${ctx.hasUI ? " and written to editor" : ""}.`,
-      "info",
-    );
+    const result = await enhanceFn(text, mode, undefined, undefined, (message) => {
+      progress.update(message);
+    });
+    output = result.enhancedPrompt;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
+    progress.stop();
+    return;
   }
+
+  try {
+    ctx.ui.setEditorText(output);
+  } catch {
+    progress.stop();
+    try {
+      await copyToClipboard(output);
+      notify(EDITOR_WRITE_WARNING, "warning");
+      notify("Enhanced prompt copied to clipboard.", "info");
+    } catch {
+      notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
+    }
+    return;
+  }
+
+  try {
+    await copyToClipboard(output);
+    notify("Enhanced prompt copied to clipboard and written to editor.", "info");
+  } catch {
+    notify(CLIPBOARD_WRITE_WARNING, "warning");
+  } finally {
+    progress.stop();
+  }
+}
+
+function createInlineStatusReporter(
+  ctx: Pick<ExtensionCommandContext, "ui">,
+): { update: (message: string) => void; stop: () => void } {
+  let message = "Enhancing prompt…";
+  let frameIndex = 0;
+
+  const render = () => {
+    const theme = ctx.ui.theme;
+    const frameText = INLINE_STATUS_FRAMES[frameIndex] ?? INLINE_STATUS_FRAMES[0]!;
+    const messageText = ` prompt-gen: ${message}`;
+    const frame = typeof theme?.fg === "function" ? theme.fg("accent", frameText) : frameText;
+    const text = typeof theme?.fg === "function" ? theme.fg("dim", messageText) : messageText;
+    ctx.ui.setStatus(INLINE_STATUS_KEY, `${frame}${text}`);
+  };
+
+  render();
+
+  const timer = setInterval(() => {
+    frameIndex = (frameIndex + 1) % INLINE_STATUS_FRAMES.length;
+    render();
+  }, INLINE_STATUS_INTERVAL_MS);
+
+  return {
+    update(nextMessage: string) {
+      const normalized = nextMessage.trim();
+      if (!normalized) return;
+      message = normalized;
+      render();
+    },
+    stop() {
+      clearInterval(timer);
+      ctx.ui.setStatus(INLINE_STATUS_KEY, undefined);
+    },
+  };
 }
 
 export { enhancePrompt } from "../src/index.js";

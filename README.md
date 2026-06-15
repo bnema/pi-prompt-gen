@@ -49,11 +49,13 @@ Open the modal with:
 /prompt
 ```
 
-You can also prefill it directly:
+Run the full enhancer inline with a plain string argument:
 
 ```text
 /prompt fix the sidebar sorting by recent first
 ```
+
+That inline path reuses the same isolated browse + enhance pipeline as the modal, shows live footer status/progress while it runs, then copies the result to the clipboard and writes it back into the Pi editor.
 
 Global shortcut registered by the extension:
 
@@ -63,7 +65,7 @@ Ctrl+Shift+G
 
 If your terminal does not report `Ctrl+Shift+G` distinctly, Pi may treat it as `Ctrl+G` and open the external editor instead.
 
-Prefill order:
+When the modal opens, prefill order is:
 
 1. command arguments
 2. current Pi editor text
@@ -83,7 +85,7 @@ Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated
 - use local code and project-discovery tools when available: `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, `codegraph_status`
 - select a small set of relevant file refs to inject into the final prompt
 
-When that browse pass runs, the modal shows progress so you can see when it is examining the codebase, using tools, and generating the final prompt.
+When that browse pass runs, the modal shows progress and the inline command path shows footer status updates so you can see when it is examining the codebase, using tools, and generating the final prompt.
 
 ## Modal model
 
@@ -128,8 +130,8 @@ It does **not** reuse the parent session history or parent session id.
 
 The full modal is a TUI feature.
 
-- in Pi TUI mode, it opens as an overlay modal
-- in other UI-capable modes, it falls back to inline enhancement behavior
+- in Pi TUI mode, `/prompt` opens as an overlay modal and `/prompt <text>` runs inline
+- in other UI-capable modes, it uses inline enhancement behavior
 - in no-UI contexts, it fails explicitly and asks you to use Pi TUI or another UI-capable session
 
 ## Develop
