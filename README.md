@@ -6,8 +6,9 @@ Generate or rewrite prompts inside Pi with a modal prompt enhancer.
 
 - rewrites a weak prompt without changing its core intent
 - generates a solid prompt from a rough idea or vague issue statement
-- adds only small, relevant repo refs and likely entrypoints
-- reuses the currently selected Pi model
+- runs a real read-only browse pass before enhancement to inspect the codebase
+- reuses the currently selected Pi model for both browsing and final prompt generation
+- can use safe information tools available in Pi during the browse pass, such as code/doc search when present
 - keeps enhancement calls isolated from the parent session history and session id
 - stays strictly in prompt-generation mode instead of solving the underlying task
 
@@ -74,6 +75,16 @@ Default mode:
 - non-empty draft → `rewrite`
 - blank draft → `generate`
 
+## Browse pass
+
+Before generating the final enhanced prompt, `pi-prompt-gen` now runs an isolated read-only browse pass that can:
+
+- inspect the repository with read-only file tools
+- use safe information tools that are available in Pi, such as code/doc search
+- select a small set of relevant file refs to inject into the final prompt
+
+The modal shows progress while this happens, so you can see when it is examining the codebase, using tools, and generating the final prompt.
+
 ## Modal model
 
 The modal is organized as:
@@ -107,7 +118,7 @@ If the preview is truncated, the modal tells you that the hidden lines still cou
 The enhancement pipeline uses explicit inputs only:
 
 - the selected model
-- the current cwd for repo-scoped ref search
+- the current cwd for the isolated browse pass
 - the raw user draft as the user message
 - the rewrite/generate guardrail harness as the system prompt
 

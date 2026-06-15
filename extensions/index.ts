@@ -1,22 +1,38 @@
 /**
- * pi-prompt-gen extension entry point (Phases 3 & 4).
+ * pi-prompt-gen extension entry point.
  *
  * Registers the /prompt command that opens the modal prompt enhancer.
- *
- * Prefill rules:
- *  1. If command args are provided → use them as draft text.
- *  2. Else if editor has non-empty text → prefill with editor text.
- *  3. Otherwise → start blank (generate mode).
- *
- * In TUI mode: opens the full modal overlay.
- * Outside TUI: falls back to an editor() dialog, or notifies the user.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { browseCodebase } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
 import { PromptGenModal } from "../src/modal.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
+
+const SAFE_BROWSE_TOOL_NAMES = new Set([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "code_search",
+  "web_search",
+  "fetch_content",
+  "project_memory_read",
+  "project_memory_search",
+  "diagnostics",
+  "editor_context",
+  "codegraph_explore",
+  "codegraph_node",
+  "codegraph_status",
+]);
+
+interface ResolvedEnhanceConfig {
+  model: NonNullable<ExtensionCommandContext["model"]>;
+  apiKey: string;
+  headers?: Record<string, string>;
+}
 
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -25,44 +41,12 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     const initialText = resolveInitialText(args, ctx);
     const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
     const initialTextLabel = resolvePrefillLabel(args, ctx);
+    const notify = (msg: string, type?: "info" | "warning" | "error") => ctx.ui.notify(msg, type);
 
-    const model = ctx.model;
-    if (!model) {
-      ctx.ui.notify(
-        "No active model. Select a model before using /prompt.",
-        "error",
-      );
-      return;
-    }
+    const enhanceConfig = await resolveEnhanceConfig(ctx);
+    if (!enhanceConfig) return;
 
-    const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-    if (!auth.ok) {
-      ctx.ui.notify(
-        `No API key configured for ${model.provider}: ${auth.error}`,
-        "error",
-      );
-      return;
-    }
-
-    const enhanceFn = (
-      text: string,
-      mode: EnhancerMode,
-      signal?: AbortSignal,
-      previousOutput?: string,
-    ) =>
-      enhancePrompt({
-        input: text,
-        mode,
-        cwd: ctx.cwd,
-        model,
-        apiKey: auth.apiKey ?? "",
-        headers: auth.headers,
-        signal,
-        previousOutput,
-      });
-
-    const notify = (msg: string, type?: "info" | "warning" | "error") =>
-      ctx.ui.notify(msg, type);
+    const enhanceFn = createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi));
 
     if (ctx.mode !== "tui") {
       await runNonTuiFallback(ctx, initialText, initialMode, enhanceFn, pi, notify);
@@ -128,40 +112,15 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       const initialText = resolveShortcutPrefill(ctx);
       const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
       const initialTextLabel = resolveShortcutPrefillLabel(ctx);
-      const model = ctx.model;
-      if (!model) {
-        ctx.ui.notify("No active model. Select a model before using pi-prompt-gen.", "error");
-        return;
-      }
-
-      const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
-      if (!auth.ok) {
-        ctx.ui.notify(`No API key configured for ${model.provider}: ${auth.error}`, "error");
-        return;
-      }
+      const enhanceConfig = await resolveEnhanceConfig(ctx as ExtensionCommandContext);
+      if (!enhanceConfig) return;
 
       if (ctx.mode !== "tui") {
         ctx.ui.notify("The global pi-prompt-gen shortcut is available in Pi TUI mode only.", "warning");
         return;
       }
 
-      const enhanceFn = (
-        text: string,
-        mode: EnhancerMode,
-        signal?: AbortSignal,
-        previousOutput?: string,
-      ) =>
-        enhancePrompt({
-          input: text,
-          mode,
-          cwd: ctx.cwd,
-          model,
-          apiKey: auth.apiKey ?? "",
-          headers: auth.headers,
-          signal,
-          previousOutput,
-        });
-
+      const enhanceFn = createEnhanceFn(ctx as ExtensionCommandContext, enhanceConfig, resolveBrowseToolNames(pi));
       const modal = new PromptGenModal({
         initialText,
         initialTextLabel,
@@ -197,6 +156,71 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       );
     },
   });
+}
+
+function createEnhanceFn(
+  ctx: ExtensionCommandContext,
+  config: ResolvedEnhanceConfig,
+  browseTools: string[],
+): (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => ReturnType<typeof enhancePrompt> {
+  return async (
+    text: string,
+    mode: EnhancerMode,
+    signal?: AbortSignal,
+    previousOutput?: string,
+    onProgress?: (message: string) => void,
+  ) => {
+    const refs = ctx.cwd
+      ? await browseCodebase({
+        input: text,
+        cwd: ctx.cwd,
+        model: config.model,
+        apiKey: config.apiKey,
+        headers: config.headers,
+        signal,
+        tools: browseTools,
+        onProgress,
+      })
+      : [];
+
+    onProgress?.("Generating enhanced prompt…");
+    return enhancePrompt({
+      input: text,
+      mode,
+      cwd: ctx.cwd,
+      model: config.model,
+      apiKey: config.apiKey,
+      headers: config.headers,
+      signal,
+      previousOutput,
+      relevantRefs: refs,
+    });
+  };
+}
+
+function resolveBrowseToolNames(pi: ExtensionAPI): string[] {
+  const available = new Set(pi.getAllTools().map((tool) => tool.name));
+  return [...SAFE_BROWSE_TOOL_NAMES].filter((toolName) => available.has(toolName));
+}
+
+async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<ResolvedEnhanceConfig | undefined> {
+  const model = ctx.model;
+  if (!model) {
+    ctx.ui.notify("No active model. Select a model before using /prompt.", "error");
+    return undefined;
+  }
+
+  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  if (!auth.ok) {
+    ctx.ui.notify(`No API key configured for ${model.provider}: ${auth.error}`, "error");
+    return undefined;
+  }
+
+  return {
+    model,
+    apiKey: auth.apiKey ?? "",
+    headers: auth.headers,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -282,7 +306,7 @@ async function runNonTuiFallback(
   ctx: ExtensionCommandContext,
   initialText: string,
   initialMode: EnhancerMode,
-  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string) => ReturnType<typeof enhancePrompt>,
+  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => ReturnType<typeof enhancePrompt>,
   pi: ExtensionAPI,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
 ): Promise<void> {
@@ -294,8 +318,6 @@ async function runNonTuiFallback(
   }
 
   const hasDialog = typeof ctx.ui.editor === "function";
-
-  // Get text from user (prefill if available)
   let text = initialText;
 
   if (!text && hasDialog) {
@@ -318,33 +340,30 @@ async function runNonTuiFallback(
     return;
   }
 
-  // Run enhancement
   notify("Enhancing prompt…", "info");
   try {
     const result = await enhanceFn(text, initialMode);
     const output = result.enhancedPrompt;
 
-    // Write to editor if available
     if (ctx.hasUI) {
       ctx.ui.setEditorText(output);
     }
 
-    // Copy to clipboard as a convenience
     await copyToClipboard(output);
     notify(
       `Enhanced prompt copied to clipboard${ctx.hasUI ? " and written to editor" : ""}.`,
       "info",
     );
-    void pi; // captured for potential send in future
+    void pi;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
   }
 }
 
-// Re-export the composed core function and its types for programmatic use.
 export { enhancePrompt } from "../src/index.js";
 export type {
   EnhancePromptOptions,
   EnhancePromptResult,
+  Ref,
 } from "../src/index.js";

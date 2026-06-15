@@ -2,35 +2,26 @@
  * Tests for src/index.ts — composed enhancePrompt() pipeline.
  *
  * Covers:
- * - Pipeline wiring: findRefs → buildEnhancerPrompt → makeModelCall
+ * - Explicit context refs are injected into the enhancer system prompt
  * - Isolated ephemeral context (no session history leaked)
  * - Structure of the returned EnhancePromptResult
- * - Skip ref-finding when cwd is not provided
  * - Model call is invoked with the correct system prompt and user content
- * - Refs are passed as context when cwd is provided
  */
 
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { FileSystem } from "../src/ref-finder.js";
 import type { Model, Api } from "@earendil-works/pi-ai";
 import type { ModelCallParams, ModelCallResult } from "../src/model-call.js";
 
-// Mock the model-call module to avoid real API calls
 const mockMakeModelCall = vi.fn<(params: ModelCallParams) => Promise<ModelCallResult>>();
 
 vi.mock("../src/model-call.js", () => ({
   makeModelCall: mockMakeModelCall,
 }));
 
-// Import *after* mocking
 const { enhancePrompt } = await import("../src/index.js");
 import type { EnhancePromptOptions } from "../src/index.js";
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function makeFakeModel(): Model<Api> {
+function makeFakeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
     id: "test-model",
     name: "Test Model",
@@ -42,6 +33,7 @@ function makeFakeModel(): Model<Api> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 8000,
     maxTokens: 2048,
+    ...overrides,
   };
 }
 
@@ -53,34 +45,6 @@ function makeBasicOptions(overrides?: Partial<EnhancePromptOptions>): EnhancePro
     ...overrides,
   };
 }
-
-/** A deterministic in-memory FileSystem for ref-finder injection. */
-function makeFs(files: Record<string, { lines: string[]; exists: boolean }>, repoRoot?: string): FileSystem {
-  return {
-    async lsRecursive(_dir: string): Promise<string[]> {
-      return Object.keys(files)
-        .filter((f) => files[f].exists)
-        .sort();
-    },
-    async readHead(filePath: string, n: number): Promise<string[]> {
-      const entry = files[filePath];
-      if (!entry || !entry.exists) return [];
-      return entry.lines.slice(0, Math.max(0, n));
-    },
-    async lineCount(filePath: string): Promise<number> {
-      const entry = files[filePath];
-      if (!entry || !entry.exists) return 0;
-      return entry.lines.length;
-    },
-    async getRepoRoot(_dir: string): Promise<string | undefined> {
-      return repoRoot;
-    },
-  };
-}
-
-// ---------------------------------------------------------------------------
-// Tests
-// ---------------------------------------------------------------------------
 
 describe("enhancePrompt (composed core path)", () => {
   beforeEach(() => {
@@ -174,63 +138,28 @@ describe("enhancePrompt (composed core path)", () => {
     expect(params.signal).toBe(signal);
   });
 
-  it("returns an empty refs array when cwd is not provided", async () => {
-    const result = await enhancePrompt(makeBasicOptions({ cwd: undefined }));
+  it("returns an empty refs array when no explicit context refs are provided", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
     expect(result.refs).toEqual([]);
   });
 
-  it("collects file refs when cwd is provided (via injectable fs)", async () => {
-    const fs = makeFs({
-      "/project/src/main.ts": {
-        lines: ["// main entry point"],
-        exists: true,
-      },
-      "/project/src/sidebar.ts": {
-        lines: ["// sidebar sort logic", "function sortByDate() {}"],
-        exists: true,
-      },
-    }, "/project");
-
+  it("includes provided ref paths as context in the system prompt", async () => {
     const result = await enhancePrompt(makeBasicOptions({
-      input: "fix the sidebar sort order by date",
-      cwd: "/project",
-      fs,
+      relevantRefs: [
+        { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
+        { path: "src/main.ts", score: 88, isEntrypoint: true },
+      ],
     }));
 
-    expect(result.refs.length).toBeGreaterThan(0);
-    // At least one ref should have a path containing "sidebar"
-    const sidebarRef = result.refs.find((r) => r.path.includes("sidebar"));
-    expect(sidebarRef).toBeDefined();
-    expect(sidebarRef!.path).toBe("src/sidebar.ts");
-    expect(sidebarRef!.score).toBeGreaterThan(0);
-    expect(typeof sidebarRef!.isEntrypoint).toBe("boolean");
-    expect(sidebarRef!.lineCount).toBeGreaterThan(0);
-  });
-
-  it("includes ref paths as context in the system prompt when refs are found", async () => {
-    const fs = makeFs({
-      "/project/main.ts": {
-        lines: ["// main entry"],
-        exists: true,
-      },
-      "/project/sidebar.ts": {
-        lines: ["// sidebar", "sort"],
-        exists: true,
-      },
-    }, "/project");
-
-    const result = await enhancePrompt(makeBasicOptions({
-      input: "sidebar sort",
-      cwd: "/project",
-      fs,
-    }));
-
-    expect(result.systemPrompt).toContain("sidebar.ts");
+    expect(result.refs.map((ref) => ref.path)).toEqual(["src/sidebar.ts", "src/main.ts"]);
     expect(result.systemPrompt).toContain("## Context");
+    expect(result.systemPrompt).toContain("src/sidebar.ts");
+    expect(result.systemPrompt).toContain("src/main.ts");
+    expect(result.systemPrompt).toContain("<entry_point>src/main.ts</entry_point>");
   });
 
-  it("does NOT include context section in the system prompt when no refs found", async () => {
-    const result = await enhancePrompt(makeBasicOptions({ cwd: undefined }));
+  it("does NOT include context section in the system prompt when refs are absent", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
     expect(result.systemPrompt).not.toContain("## Context");
   });
 
@@ -268,10 +197,8 @@ describe("enhancePrompt (composed core path)", () => {
     await enhancePrompt(makeBasicOptions());
 
     const params = mockMakeModelCall.mock.calls[0][0] as { systemPrompt: string; userContent: string };
-    // Only one user message with the input — no history, no extra messages
     expect(params.userContent).toBeDefined();
     expect(params.systemPrompt).not.toContain("## User Input");
-    // No session-related fields in the params
     expect(params).not.toHaveProperty("sessionId");
   });
 

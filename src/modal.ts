@@ -132,7 +132,7 @@ export interface PromptGenModalOptions {
   /** Initial mode. Auto-detected from initialText when not provided. */
   mode?: EnhancerMode;
   /** Callback that performs the actual enhancement. */
-  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string) => Promise<EnhancePromptResult>;
+  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => Promise<EnhancePromptResult>;
   /** Copy text to clipboard. */
   copyFn: (text: string) => Promise<void>;
   /** Write text to the main Pi editor. */
@@ -231,6 +231,8 @@ function cursorCell(text: string, theme: Theme): string {
 
 const MAX_DRAFT_HEIGHT = 8;
 const MAX_PREVIEW_HEIGHT = 10;
+const ENHANCING_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const ENHANCING_SPINNER_INTERVAL_MS = 120;
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -247,13 +249,17 @@ export class PromptGenModal implements TuiComponent {
   private draftWrapWidth = 0; // latest wrap width from render()
   private requestVersion = 0;
   private activeAbort: AbortController | undefined;
+  private spinnerFrameIndex = 0;
+  private spinnerTimer: ReturnType<typeof setInterval> | undefined;
+  private progressMessage = "";
+  private progressLog: string[] = [];
 
   // ---- injected ----
   private theme!: Theme;
   private done!: (result: PromptGenModalResult | undefined) => void;
   private requestRender!: () => void;
   private keybindings: { matches(data: string, keybinding: string): boolean } | undefined;
-  private enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string) => Promise<EnhancePromptResult>;
+  private enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => Promise<EnhancePromptResult>;
   private copyFn: (text: string) => Promise<void>;
   private applyFn: (text: string) => void;
   private sendFn: (text: string) => Promise<void> | void;
@@ -308,9 +314,11 @@ export class PromptGenModal implements TuiComponent {
     const modeHint = this.mode === "rewrite"
       ? "refine a prompt"
       : "idea \u2192 prompt";
-    const prefillInfo = this.initialTextLabel ? dim(` (${this.initialTextLabel})`, this.theme) : "";
+    const prefillInfo = this.initialTextLabel && this.initialTextLabel !== "blank"
+      ? dim(` (${this.initialTextLabel})`, this.theme)
+      : "";
     const modeDisplay = this.status === "enhancing"
-      ? accent(`[${modeLabel}]`, this.theme) + " " + dim("enhancing\u2026", this.theme) + prefillInfo
+      ? accent(`[${modeLabel}]`, this.theme) + " " + accent(this.currentSpinnerFrame(), this.theme) + " " + dim(this.progressMessage || "enhancing\u2026", this.theme) + prefillInfo
       : accent(`[${modeLabel}]`, this.theme) + " " + dim(this.statusDisplay(), this.theme) + prefillInfo;
     lines.push(modeDisplay + "  " + dim(modeHint, this.theme) + " ".repeat(Math.max(0, inner - visibleWidth(modeDisplay) - 2 - visibleWidth(modeHint))));
 
@@ -372,11 +380,21 @@ export class PromptGenModal implements TuiComponent {
         }
       }
     } else {
-      const placeholder = this.status === "idle"
-        ? dim("Press Enter to enhance, or type your prompt.", this.theme)
-        : "";
-      lines.push(placeholder);
-      for (let i = 1; i < MAX_PREVIEW_HEIGHT; i++) lines.push("");
+      const progressLines = this.status === "enhancing"
+        ? this.progressLog.slice(-MAX_PREVIEW_HEIGHT)
+        : [];
+      if (progressLines.length > 0) {
+        for (const progressLine of progressLines) {
+          lines.push(truncateToWidth(progressLine, inner) + " ".repeat(Math.max(0, inner - visibleWidth(progressLine))));
+        }
+        for (let i = progressLines.length; i < MAX_PREVIEW_HEIGHT; i++) lines.push("");
+      } else {
+        const placeholder = this.status === "idle"
+          ? dim("Press Enter to enhance, or type your prompt.", this.theme)
+          : "";
+        lines.push(placeholder);
+        for (let i = 1; i < MAX_PREVIEW_HEIGHT; i++) lines.push("");
+      }
     }
 
     // Metadata line
@@ -696,6 +714,8 @@ export class PromptGenModal implements TuiComponent {
   private toggleMode(): void {
     this.mode = this.mode === "rewrite" ? "generate" : "rewrite";
     this.result = undefined;
+    this.progressMessage = "";
+    this.progressLog = [];
     this.setStatus("idle", `switched to ${this.mode}`);
   }
 
@@ -704,6 +724,8 @@ export class PromptGenModal implements TuiComponent {
     this.cursor = 0;
     this.draftScroll = 0;
     this.result = undefined;
+    this.progressMessage = "";
+    this.progressLog = [];
     this.setStatus("idle", "draft cleared");
     // Switch to generate mode when draft is cleared
     if (this.mode === "rewrite") {
@@ -722,6 +744,8 @@ export class PromptGenModal implements TuiComponent {
     const controller = new AbortController();
     const previousOutput = regenerate ? this.result?.enhancedPrompt : undefined;
     this.activeAbort = controller;
+    this.progressMessage = "Examining codebase…";
+    this.progressLog = ["Examining codebase…"];
     this.setStatus("enhancing", "enhancing…");
     this.result = undefined;
     this.requestRender();
@@ -732,6 +756,15 @@ export class PromptGenModal implements TuiComponent {
         this.mode,
         controller.signal,
         previousOutput,
+        (message: string) => {
+          if (!message || requestId !== this.requestVersion || controller.signal.aborted) return;
+          this.progressMessage = message;
+          if (this.progressLog[this.progressLog.length - 1] !== message) {
+            this.progressLog.push(message);
+            if (this.progressLog.length > MAX_PREVIEW_HEIGHT) this.progressLog.shift();
+          }
+          this.requestRender();
+        },
       );
       if (controller.signal.aborted || requestId !== this.requestVersion) return;
       this.result = result;
@@ -793,11 +826,20 @@ export class PromptGenModal implements TuiComponent {
   private setStatus(status: ModalStatus, message: string): void {
     this.status = status;
     this.statusMessage = message;
+
+    if (status === "enhancing") {
+      this.startSpinner();
+      return;
+    }
+
+    this.stopSpinner();
   }
 
   private invalidateEnhancedResult(message: string): void {
     if (!this.result && this.status !== "enhanced") return;
     this.result = undefined;
+    this.progressMessage = "";
+    this.progressLog = [];
     this.setStatus("idle", message);
   }
 
@@ -812,6 +854,27 @@ export class PromptGenModal implements TuiComponent {
       case "error":
         return warning(`error: ${truncateToWidth(this.statusMessage, 40)}`, this.theme);
     }
+  }
+
+  private startSpinner(): void {
+    if (this.spinnerTimer) return;
+    this.spinnerFrameIndex = 0;
+    this.spinnerTimer = setInterval(() => {
+      this.spinnerFrameIndex = (this.spinnerFrameIndex + 1) % ENHANCING_SPINNER_FRAMES.length;
+      this.requestRender();
+    }, ENHANCING_SPINNER_INTERVAL_MS);
+  }
+
+  private stopSpinner(): void {
+    if (this.spinnerTimer) {
+      clearInterval(this.spinnerTimer);
+      this.spinnerTimer = undefined;
+    }
+    this.spinnerFrameIndex = 0;
+  }
+
+  private currentSpinnerFrame(): string {
+    return ENHANCING_SPINNER_FRAMES[this.spinnerFrameIndex] ?? ENHANCING_SPINNER_FRAMES[0]!;
   }
 
   private matchesAction(data: string, binding: string, fallback: string): boolean {
