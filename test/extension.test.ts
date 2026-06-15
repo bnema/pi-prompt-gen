@@ -432,8 +432,27 @@ describe("Command handler — sendUserMessage integration", () => {
     await command.handler("test", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    modalOptions.sendFn("send this text");
+    await modalOptions.sendFn("send this text");
     expect(pi.sendUserMessage).toHaveBeenCalledWith("send this text");
+  });
+
+  it("modal sendFn clears the parent editor after sending", async () => {
+    const pi = makeExtensionAPI();
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        getEditorText: vi.fn().mockReturnValue("prefilled draft"),
+      } as ExtensionUIContext,
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.sendFn("send this text");
+
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("");
   });
 });
 

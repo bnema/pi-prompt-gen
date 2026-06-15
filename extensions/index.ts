@@ -45,13 +45,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       applyFn: (text: string) => {
         ctx.ui.setEditorText(text);
       },
-      sendFn: (text: string) => {
-        try {
-          pi.sendUserMessage(text);
-        } catch {
-          pi.sendUserMessage(text, { deliverAs: "followUp" });
-        }
-      },
+      sendFn: createSendFn(pi, ctx),
       notifyFn: notify,
     });
 
@@ -114,13 +108,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
         applyFn: (text: string) => {
           ctx.ui.setEditorText(text);
         },
-        sendFn: (text: string) => {
-          try {
-            pi.sendUserMessage(text);
-          } catch {
-            pi.sendUserMessage(text, { deliverAs: "followUp" });
-          }
-        },
+        sendFn: createSendFn(pi, ctx),
         notifyFn: (msg, type) => ctx.ui.notify(msg, type),
       });
 
@@ -188,6 +176,21 @@ function createEnhanceFn(
 function resolveBrowseToolNames(pi: ExtensionAPI): string[] {
   const available = new Set(pi.getAllTools().map((tool) => tool.name));
   return [...SAFE_BROWSE_TOOL_NAMES].filter((toolName) => available.has(toolName));
+}
+
+function createSendFn(
+  pi: ExtensionAPI,
+  ctx: Pick<ExtensionCommandContext, "ui">,
+): (text: string) => Promise<void> {
+  return async (text: string) => {
+    try {
+      pi.sendUserMessage(text);
+    } catch {
+      pi.sendUserMessage(text, { deliverAs: "followUp" });
+    }
+
+    ctx.ui.setEditorText("");
+  };
 }
 
 async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<ResolvedEnhanceConfig | undefined> {

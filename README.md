@@ -106,7 +106,7 @@ Mode labels are explicit in the UI:
 - `Alt+C` — clear the draft
 - `Alt+Y` — copy the enhanced result
 - `Alt+A` — apply the enhanced result back into the main Pi editor
-- `Alt+S` — send the enhanced result as a user message and close the modal
+- `Alt+S` — send the enhanced result as a user message, clear the parent editor, and close the modal
 - `Esc` — close the modal, or abort the in-flight enhancement
 
 `copy`, `apply`, and `send` operate on the **enhanced result** only. If no result exists yet, the modal asks you to enhance first instead of silently using the raw draft.

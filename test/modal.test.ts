@@ -213,6 +213,34 @@ describe("PromptGenModal text editing", () => {
     expect(lines.join("\n")).toContain("abc");
   });
 
+  it("accepts printable text chunks longer than one character", () => {
+    const modal = new PromptGenModal(makeModalOptions({ initialText: "draft" }));
+    bindModal(modal);
+
+    modal.render(80);
+    press(modal, " + pasted chunk");
+
+    const lines = modal.render(80);
+    expect(lines.join("\n")).toContain("draft + pasted chunk");
+  });
+
+  it("preserves bracketed paste content after initial render without retriggering initial prefill", () => {
+    const enhanceFn = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "existing draft",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    modal.render(80);
+    press(modal, "\u001b[200~ + pasted line 1\npasted line 2\u001b[201~");
+
+    const joined = modal.render(80).join("\n");
+    expect(joined).toContain("existing draft + pasted line 1");
+    expect(joined).toContain("pasted line 2");
+    expect(enhanceFn).not.toHaveBeenCalled();
+  });
+
   it("backspace removes character before cursor", () => {
     const modal = new PromptGenModal(makeModalOptions({ initialText: "abc" }));
     bindModal(modal);
