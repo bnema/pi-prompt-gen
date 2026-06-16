@@ -173,10 +173,16 @@ function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
 
 beforeEach(() => {
   vi.clearAllMocks();
-  mockBrowseCodebase.mockResolvedValue([]);
+  mockBrowseCodebase.mockResolvedValue({
+    refs: [],
+    gitContext: undefined,
+    sessionContext: undefined,
+  });
   mockEnhancePrompt.mockResolvedValue({
     enhancedPrompt: "Enhanced result text",
     refs: [],
+    gitContext: undefined,
+    sessionContext: undefined,
     systemPrompt: "",
     modelResult: { content: "Enhanced result text", stopReason: "stop" },
   });
@@ -585,10 +591,23 @@ describe("Command handler — sendUserMessage integration", () => {
 
 describe("Command handler — enhance function wrapper", () => {
   it("runs an isolated browse pass with the active model before enhancement", async () => {
-    mockBrowseCodebase.mockResolvedValue([
-      { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
-      { path: "src/main.ts", score: 88, isEntrypoint: true },
-    ]);
+    mockBrowseCodebase.mockResolvedValue({
+      refs: [
+        { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
+        { path: "src/main.ts", score: 88, isEntrypoint: true },
+      ],
+      gitContext: {
+        branch: "feat/prompt-browse-context",
+        statusSummary: "2 unstaged files.",
+        changedFiles: ["src/browse-pass.ts"],
+        diffSummary: "Browse-pass plumbing is being updated.",
+      },
+      sessionContext: {
+        relevantMessages: [
+          { role: "user", text: "Please make the prompt generator understand follow-up context." },
+        ],
+      },
+    });
 
     const ctx = makeMockContext({ cwd: "/my/project" });
     const pi = makeExtensionAPI();
@@ -607,6 +626,7 @@ describe("Command handler — enhance function wrapper", () => {
       apiKey: "sk-test",
       headers: undefined,
       tools: ["read", "grep", "find", "ls", "code_search", "project_memory_read", "project_memory_search", "codegraph_explore", "codegraph_node", "codegraph_status"],
+      sessionHistory: [],
     }));
 
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
@@ -619,6 +639,17 @@ describe("Command handler — enhance function wrapper", () => {
         { path: "src/sidebar.ts", score: 97, isEntrypoint: false },
         { path: "src/main.ts", score: 88, isEntrypoint: true },
       ],
+      gitContext: {
+        branch: "feat/prompt-browse-context",
+        statusSummary: "2 unstaged files.",
+        changedFiles: ["src/browse-pass.ts"],
+        diffSummary: "Browse-pass plumbing is being updated.",
+      },
+      sessionContext: {
+        relevantMessages: [
+          { role: "user", text: "Please make the prompt generator understand follow-up context." },
+        ],
+      },
     }));
   });
 
@@ -664,7 +695,64 @@ describe("Command handler — enhance function wrapper", () => {
     }));
   });
 
-  it("skips the browse pass when no safe browse tools are available", async () => {
+  it("passes current-branch user and assistant messages into the browse pass as queryable history", async () => {
+    const ctx = makeMockContext({
+      cwd: "/my/project",
+      sessionManager: {
+        getBranch: vi.fn().mockReturnValue([
+          { type: "message", message: { role: "user", content: [{ type: "text", text: "Review the extension docs and inspect git diff support." }] } },
+          { type: "message", message: { role: "assistant", content: [{ type: "text", text: "The current browse pass lacks git diff visibility." }] } },
+          { type: "message", message: { role: "tool", content: [{ type: "text", text: "ignore me" }] } },
+        ]),
+        getEntries: vi.fn().mockReturnValue([]),
+      } as any,
+    });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([{ name: "write" }]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      tools: [],
+      sessionHistory: [
+        { role: "user", text: "Review the extension docs and inspect git diff support." },
+        { role: "assistant", text: "The current browse pass lacks git diff visibility." },
+      ],
+    }));
+  });
+
+  it("does not fall back to full session entries for browse history when current-branch access is unavailable", async () => {
+    const ctx = makeMockContext({
+      cwd: "/my/project",
+      sessionManager: {
+        getEntries: vi.fn().mockReturnValue([
+          { type: "message", message: { role: "user", content: [{ type: "text", text: "non-branch session entry" }] } },
+        ]),
+      } as any,
+    });
+    const pi = makeExtensionAPI({
+      getAllTools: vi.fn().mockReturnValue([{ name: "write" }]),
+    });
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      sessionHistory: [],
+    }));
+  });
+
+  it("still runs the browse pass when only internal browse context tools are available", async () => {
     const ctx = makeMockContext({ cwd: "/my/project" });
     const pi = makeExtensionAPI({
       getAllTools: vi.fn().mockReturnValue([{ name: "write" }]),
@@ -677,7 +765,10 @@ describe("Command handler — enhance function wrapper", () => {
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     await modalOptions.enhanceFn("my text", "generate");
 
-    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      tools: [],
+      cwd: "/my/project",
+    }));
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       relevantRefs: [],
     }));
