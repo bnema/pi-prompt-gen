@@ -1,25 +1,48 @@
 /**
  * Isolated read-only browse pass for pi-prompt-gen.
  *
- * Uses a temporary AgentSession with the active model and a safe tool allowlist
- * to examine the codebase, then returns a minimal JSON list of relevant refs.
+ * Uses a temporary AgentSession with the active model, a safe tool allowlist,
+ * and a small set of internal read-only browse tools to inspect the codebase,
+ * current git context, and bounded current-branch conversation context. It
+ * returns a small structured JSON payload for the final prompt-enhancement
+ * model.
  */
 
+import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
-import type { Api, Model } from "@earendil-works/pi-ai";
+import { Type, type Api, type Model } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
   createAgentSession,
   DefaultResourceLoader,
+  defineTool,
   getAgentDir,
   ModelRegistry,
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { Ref } from "./index.js";
+import type { GitContext, Ref, SessionContext, SessionContextMessage } from "./index.js";
 
 const DEFAULT_MAX_REFS = 5;
+const INTERNAL_GIT_TOOL_NAME = "git_context";
+const INTERNAL_SESSION_HISTORY_TOOL_NAME = "session_history";
+const DEFAULT_HISTORY_PAGE_SIZE = 5;
+const MAX_HISTORY_PAGE_SIZE = 10;
+const MAX_HISTORY_SNAPSHOT_MESSAGES = 40;
+const MAX_HISTORY_MESSAGE_CHARS = 2_000;
+const MAX_HISTORY_TOTAL_CHARS = 20_000;
+const MAX_CHANGED_FILES = 12;
+const MAX_SELECTED_MESSAGES = 4;
+const MAX_SELECTED_MESSAGE_CHARS = 500;
+const MAX_GIT_SUMMARY_CHARS = 600;
+const MAX_GIT_DIFF_CHARS = 4_000;
+const DEFAULT_GIT_DIFF_LINES = 120;
+const MAX_GIT_DIFF_LINES = 200;
+const DEFAULT_GIT_DIFF_BYTES = 12_000;
+const MAX_GIT_DIFF_BYTES = 20_000;
+const GIT_COMMAND_TIMEOUT_MS = 1_500;
+const GIT_COMMAND_MAX_BYTES = 64 * 1024;
 
 export const SAFE_BROWSE_TOOL_NAMES = new Set([
   "read",
@@ -40,6 +63,17 @@ interface ParsedRef {
   isEntrypoint: boolean;
 }
 
+export interface BrowseSessionHistoryMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+export interface BrowseCodebaseResult {
+  refs: Ref[];
+  gitContext?: GitContext;
+  sessionContext?: SessionContext;
+}
+
 export interface BrowseCodebaseOptions {
   input: string;
   cwd: string;
@@ -47,12 +81,50 @@ export interface BrowseCodebaseOptions {
   apiKey: string;
   headers?: Record<string, string>;
   tools: string[];
+  sessionHistory?: BrowseSessionHistoryMessage[];
   signal?: AbortSignal;
   maxRefs?: number;
   onProgress?: (message: string) => void;
 }
 
-export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Ref[]> {
+interface ParsedBrowseResult {
+  refs: ParsedRef[];
+  gitContext?: GitContext;
+  sessionContext?: SessionContext;
+}
+
+interface GitSummaryPayload {
+  branch?: string;
+  statusSummary?: string;
+  changedFiles?: string[];
+  diffSummary?: string;
+}
+
+interface GitDiffPayload {
+  scope: "working_tree" | "staged";
+  diff: string;
+  truncated: boolean;
+  paths?: string[];
+}
+
+interface GitToolDetails {
+  kind: "summary" | "diff";
+  branch?: string;
+  statusSummary?: string;
+  changedFiles?: string[];
+  diffSummary?: string;
+  scope?: "working_tree" | "staged";
+  diff?: string;
+  truncated?: boolean;
+  paths?: string[];
+}
+
+interface ObservedBrowseContext {
+  gitSummary?: GitSummaryPayload;
+  sessionHistory: BrowseSessionHistoryMessage[];
+}
+
+export async function browseCodebase(options: BrowseCodebaseOptions): Promise<BrowseCodebaseResult> {
   const {
     input,
     cwd,
@@ -60,6 +132,7 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
     apiKey,
     headers,
     tools,
+    sessionHistory = [],
     signal,
     maxRefs: rawMaxRefs = DEFAULT_MAX_REFS,
     onProgress,
@@ -67,9 +140,13 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
 
   const maxRefs = normalizeMaxRefs(rawMaxRefs);
   const safeTools = filterSafeBrowseTools(tools);
+  const normalizedSessionHistory = normalizeSessionHistorySnapshot(sessionHistory);
+  const observedContext: ObservedBrowseContext = { sessionHistory: normalizedSessionHistory };
+  const customTools = createInternalBrowseTools(cwd, normalizedSessionHistory, observedContext);
+  const activeTools = [...safeTools, ...customTools.map((tool) => tool.name)];
 
   throwIfAborted(signal);
-  if (!cwd || safeTools.length === 0) return [];
+  if (!cwd || activeTools.length === 0) return { refs: [] };
 
   const authStorage = AuthStorage.inMemory();
   authStorage.setRuntimeApiKey(model.provider, apiKey);
@@ -107,7 +184,8 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
     authStorage,
     modelRegistry,
     resourceLoader: loader,
-    tools: safeTools,
+    tools: activeTools,
+    customTools,
     sessionManager: SessionManager.inMemory(cwd),
     settingsManager,
   });
@@ -134,8 +212,8 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
 
     onProgress?.("Selecting useful references…");
     const responseText = extractLastAssistantText(session.messages);
-    const parsedRefs = parseRefs(responseText);
-    return await sanitizeRefs(parsedRefs, cwd, maxRefs);
+    const parsed = parseBrowseResult(responseText);
+    return await sanitizeBrowseResult(parsed, cwd, maxRefs, observedContext);
   } finally {
     signal?.removeEventListener("abort", abort);
     unsubscribe();
@@ -146,14 +224,16 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Re
 function buildBrowseSystemPrompt(maxRefs: number): string {
   return [
     "You are a codebase browsing scout.",
-    "Use only the available read-only and information tools to inspect the repository and any available documentation search tools.",
+    "Use only the available read-only and information tools to inspect the repository, bounded git context, and bounded current-branch conversation context when they are useful.",
     "Do not edit files, do not propose code changes, and do not solve the task.",
-    "Your only job is to identify the smallest useful set of files a later prompt-enhancement model should reference.",
+    "Your only job is to identify the smallest useful set of files and structured supporting context a later prompt-enhancement model should reference.",
     "",
     "Return ONLY JSON in this shape:",
-    '{"refs":[{"path":"src/file.ts","score":97,"isEntrypoint":false}]}',
+    '{"refs":[{"path":"src/file.ts","score":97,"isEntrypoint":false}],"gitContext":{"branch":"feat/name","statusSummary":"2 modified files.","changedFiles":["src/file.ts"],"diffSummary":"Recent local changes adjust browse-pass plumbing."},"sessionContext":{"relevantMessages":[{"role":"user","text":"Follow up on the earlier browse-pass review."}]}}',
     `Return at most ${maxRefs} refs.`,
-    "Never invent paths. Only return files you actually inspected or directly inferred from inspected code and tool results.",
+    `Return at most ${MAX_CHANGED_FILES} changed files and at most ${MAX_SELECTED_MESSAGES} conversation messages when those sections are useful.`,
+    "Only include gitContext or sessionContext when they materially help the later prompt rewrite.",
+    "Never invent paths, branch names, diffs, or conversation messages. Only return information you actually inspected or directly inferred from inspected tool results.",
   ].join("\n");
 }
 
@@ -163,8 +243,266 @@ function buildBrowseUserPrompt(input: string, maxRefs: number): string {
     input,
     "",
     `Browse the codebase and return at most ${maxRefs} file refs that would best ground a later prompt rewrite.`,
+    "Use git_context or session_history only when they help preserve continuity for follow-up work.",
     "Prefer entry points, primary implementation files, and the smallest useful support files.",
   ].join("\n");
+}
+
+function createInternalBrowseTools(
+  cwd: string,
+  sessionHistory: BrowseSessionHistoryMessage[],
+  observedContext: ObservedBrowseContext,
+): Array<ReturnType<typeof defineTool>> {
+  const tools = [createGitContextTool(cwd, observedContext)];
+  if (sessionHistory.length > 0) {
+    tools.push(createSessionHistoryTool(sessionHistory));
+  }
+  return tools;
+}
+
+function createGitContextTool(cwd: string, observedContext: ObservedBrowseContext) {
+  return defineTool({
+    name: INTERNAL_GIT_TOOL_NAME,
+    label: "Git Context",
+    description: "Read-only bounded git branch, status, and diff context for the current repository.",
+    parameters: Type.Object({
+      action: Type.Optional(Type.String()),
+      staged: Type.Optional(Type.Boolean()),
+      paths: Type.Optional(Type.Array(Type.String())),
+      maxLines: Type.Optional(Type.Number()),
+      maxBytes: Type.Optional(Type.Number()),
+    }),
+    async execute(
+      _toolCallId: string,
+      params: { action?: string; staged?: boolean; paths?: string[]; maxLines?: number; maxBytes?: number },
+      signal?: AbortSignal,
+    ) {
+      const action = typeof params.action === "string" && params.action.trim() ? params.action.trim() : "summary";
+      if (action === "diff") {
+        const requestedPaths = Array.isArray(params.paths) && params.paths.length > 0;
+        const normalizedPaths = normalizePathList(params.paths);
+        const result = requestedPaths && !normalizedPaths
+          ? { scope: params.staged === true ? "staged" as const : "working_tree" as const, diff: "", truncated: false, paths: [] }
+          : await getGitDiff(cwd, {
+            staged: params.staged === true,
+            paths: normalizedPaths,
+            maxLines: normalizeBoundedNumber(params.maxLines, DEFAULT_GIT_DIFF_LINES, MAX_GIT_DIFF_LINES),
+            maxBytes: normalizeBoundedNumber(params.maxBytes, DEFAULT_GIT_DIFF_BYTES, MAX_GIT_DIFF_BYTES),
+          }, signal);
+        const details: GitToolDetails = {
+          kind: "diff",
+          scope: result.scope,
+          diff: result.diff,
+          truncated: result.truncated,
+          paths: result.paths,
+        };
+        return {
+          content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+          details,
+        };
+      }
+
+      const result = await getGitSummary(cwd, signal);
+      observedContext.gitSummary = result;
+      const details: GitToolDetails = {
+        kind: "summary",
+        branch: result.branch,
+        statusSummary: result.statusSummary,
+        changedFiles: result.changedFiles,
+        diffSummary: result.diffSummary,
+      };
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details,
+      };
+    },
+  });
+}
+
+function createSessionHistoryTool(sessionHistory: BrowseSessionHistoryMessage[]) {
+  return defineTool({
+    name: INTERNAL_SESSION_HISTORY_TOOL_NAME,
+    label: "Session History",
+    description: "Read-only bounded current-branch user and assistant conversation history for follow-up context.",
+    parameters: Type.Object({
+      offset: Type.Optional(Type.Number()),
+      limit: Type.Optional(Type.Number()),
+      role: Type.Optional(Type.String()),
+      query: Type.Optional(Type.String()),
+      latestFirst: Type.Optional(Type.Boolean()),
+    }),
+    async execute(_toolCallId, params) {
+      const offset = Math.max(0, Math.floor(typeof params.offset === "number" && Number.isFinite(params.offset) ? params.offset : 0));
+      const limit = normalizeBoundedNumber(params.limit, DEFAULT_HISTORY_PAGE_SIZE, MAX_HISTORY_PAGE_SIZE);
+      const role = params.role === "user" || params.role === "assistant" ? params.role : undefined;
+      const query = typeof params.query === "string" ? params.query.trim().toLowerCase() : "";
+      const latestFirst = params.latestFirst === true;
+
+      let filtered = sessionHistory.map((message, index) => ({ index, ...message }));
+      if (role) {
+        filtered = filtered.filter((message) => message.role === role);
+      }
+      if (query) {
+        filtered = filtered.filter((message) => message.text.toLowerCase().includes(query));
+      }
+      if (latestFirst) {
+        filtered = [...filtered].reverse();
+      }
+
+      const total = filtered.length;
+      const messages = filtered.slice(offset, offset + limit);
+      const result = {
+        messages,
+        page: {
+          offset,
+          limit,
+          returned: messages.length,
+          total,
+          hasMore: offset + messages.length < total,
+        },
+      };
+
+      return {
+        content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
+        details: result,
+      };
+    },
+  });
+}
+
+async function getGitSummary(cwd: string, signal?: AbortSignal): Promise<GitSummaryPayload> {
+  const repo = await resolveGitRepository(cwd, signal);
+  if (!repo) {
+    return {
+      statusSummary: "Git context unavailable.",
+      changedFiles: [],
+    };
+  }
+
+  const branch = await resolveGitBranch(cwd, signal);
+  const status = await runGit(["status", "--porcelain=v1"], cwd, signal);
+  const diffStat = await runGit(["diff", "--stat", "--compact-summary"], cwd, signal);
+  const stagedDiffStat = await runGit(["diff", "--cached", "--stat", "--compact-summary"], cwd, signal);
+
+  const statusSummary = summarizeStatus(status.stdout);
+  const changedFiles = collectChangedFiles(status.stdout);
+  const diffSummary = summarizeDiffStats(diffStat.stdout, stagedDiffStat.stdout);
+
+  return {
+    branch,
+    statusSummary,
+    changedFiles,
+    diffSummary,
+  };
+}
+
+async function getGitDiff(
+  cwd: string,
+  options: { staged: boolean; paths?: string[]; maxLines: number; maxBytes: number },
+  signal?: AbortSignal,
+): Promise<GitDiffPayload> {
+  const args = ["diff", "--no-ext-diff"];
+  if (options.staged) args.push("--cached");
+  if (options.paths?.length) {
+    args.push("--", ...options.paths);
+  }
+
+  const result = await runGit(args, cwd, signal, options.maxBytes * 2);
+  const truncated = truncateLinesAndBytes(result.stdout.trim(), options.maxLines, options.maxBytes);
+
+  return {
+    scope: options.staged ? "staged" : "working_tree",
+    diff: truncated.content,
+    truncated: truncated.truncated,
+    paths: options.paths?.length ? options.paths : undefined,
+  };
+}
+
+async function resolveGitRepository(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+  const result = await runGit(["rev-parse", "--show-toplevel"], cwd, signal);
+  const stdout = result.stdout.trim();
+  return stdout || undefined;
+}
+
+async function resolveGitBranch(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
+  const branch = (await runGit(["branch", "--show-current"], cwd, signal)).stdout.trim();
+  if (branch) return branch;
+  const detached = (await runGit(["rev-parse", "--short", "HEAD"], cwd, signal)).stdout.trim();
+  return detached ? `detached@${detached}` : undefined;
+}
+
+async function runGit(
+  args: string[],
+  cwd: string,
+  signal?: AbortSignal,
+  maxBytes = GIT_COMMAND_MAX_BYTES,
+): Promise<{ stdout: string; stderr: string; code: number | null }> {
+  if (signal?.aborted) throwIfAborted(signal);
+
+  return new Promise((resolvePromise, reject) => {
+    const child = spawn("git", args, {
+      cwd,
+      stdio: ["ignore", "pipe", "pipe"],
+      signal,
+    });
+
+    let stdout = "";
+    let stderr = "";
+    let killedForOutputLimit = false;
+    let resolved = false;
+
+    const resolveOnce = (result: { stdout: string; stderr: string; code: number | null }) => {
+      if (resolved) return;
+      resolved = true;
+      resolvePromise(result);
+    };
+
+    const timer = setTimeout(() => {
+      child.kill("SIGTERM");
+    }, GIT_COMMAND_TIMEOUT_MS);
+
+    const appendChunk = (current: string, chunk: Buffer | string): string => {
+      const next = current + chunk.toString("utf8");
+      if (Buffer.byteLength(next, "utf8") <= maxBytes) return next;
+      killedForOutputLimit = true;
+      child.kill("SIGTERM");
+      return truncateBytes(next, maxBytes);
+    };
+
+    child.stdout.on("data", (chunk) => {
+      stdout = appendChunk(stdout, chunk);
+    });
+    child.stderr.on("data", (chunk) => {
+      stderr = appendChunk(stderr, chunk);
+    });
+
+    child.once("error", (error) => {
+      clearTimeout(timer);
+      if ((error as NodeJS.ErrnoException).name === "AbortError") {
+        reject(error);
+        return;
+      }
+      resolveOnce({ stdout: "", stderr: error.message, code: 1 });
+    });
+
+    child.once("close", (code) => {
+      clearTimeout(timer);
+      if (killedForOutputLimit) {
+        stdout = truncateBytes(stdout, maxBytes);
+        stderr = truncateBytes(stderr, maxBytes);
+      }
+      resolveOnce({ stdout, stderr, code });
+    });
+  });
+}
+
+function parseBrowseResult(content: string): ParsedBrowseResult {
+  const parsed = parseJsonObject(content);
+  return {
+    refs: parseRefsFromJson(parsed),
+    gitContext: parseGitContextFromJson(parsed),
+    sessionContext: parseSessionContextFromJson(parsed),
+  };
 }
 
 function extractLastAssistantText(messages: ReadonlyArray<{ role?: unknown; content?: unknown }>): string {
@@ -186,8 +524,7 @@ function extractLastAssistantText(messages: ReadonlyArray<{ role?: unknown; cont
   return "";
 }
 
-function parseRefs(content: string): ParsedRef[] {
-  const parsed = parseJsonObject(content);
+function parseRefsFromJson(parsed: unknown): ParsedRef[] {
   const rawRefs =
     parsed && typeof parsed === "object" && Array.isArray((parsed as { refs?: unknown }).refs)
       ? (parsed as { refs: unknown[] }).refs
@@ -212,6 +549,96 @@ function parseRefs(content: string): ParsedRef[] {
   }
 
   return refs;
+}
+
+function parseGitContextFromJson(parsed: unknown): GitContext | undefined {
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const raw = (parsed as { gitContext?: unknown }).gitContext;
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const branch = normalizeInlineText((raw as { branch?: unknown }).branch, 200);
+  const statusSummary = normalizeInlineText((raw as { statusSummary?: unknown }).statusSummary, MAX_GIT_SUMMARY_CHARS);
+  const changedFiles = normalizeStringArray((raw as { changedFiles?: unknown }).changedFiles, MAX_CHANGED_FILES, 300);
+  const diffSummary = normalizeInlineText((raw as { diffSummary?: unknown }).diffSummary, MAX_GIT_DIFF_CHARS);
+
+  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary) return undefined;
+
+  return {
+    branch: branch || undefined,
+    statusSummary: statusSummary || undefined,
+    changedFiles: changedFiles.length > 0 ? changedFiles : undefined,
+    diffSummary: diffSummary || undefined,
+  };
+}
+
+function parseSessionContextFromJson(parsed: unknown): SessionContext | undefined {
+  if (!parsed || typeof parsed !== "object") return undefined;
+  const raw = (parsed as { sessionContext?: unknown }).sessionContext;
+  if (!raw || typeof raw !== "object") return undefined;
+
+  const rawMessages = Array.isArray((raw as { relevantMessages?: unknown }).relevantMessages)
+    ? (raw as { relevantMessages: unknown[] }).relevantMessages
+    : [];
+
+  const relevantMessages: SessionContextMessage[] = [];
+  for (const rawMessage of rawMessages) {
+    if (!rawMessage || typeof rawMessage !== "object") continue;
+    const role = (rawMessage as { role?: unknown }).role;
+    const text = normalizeInlineText((rawMessage as { text?: unknown }).text, MAX_SELECTED_MESSAGE_CHARS);
+    if ((role !== "user" && role !== "assistant") || !text) continue;
+    relevantMessages.push({ role, text });
+    if (relevantMessages.length >= MAX_SELECTED_MESSAGES) break;
+  }
+
+  if (relevantMessages.length === 0) return undefined;
+  return { relevantMessages };
+}
+
+async function sanitizeBrowseResult(
+  parsed: ParsedBrowseResult,
+  cwd: string,
+  maxRefs: number,
+  observedContext: ObservedBrowseContext,
+): Promise<BrowseCodebaseResult> {
+  return {
+    refs: await sanitizeRefs(parsed.refs, cwd, maxRefs),
+    gitContext: parsed.gitContext ? sanitizeObservedGitContext(observedContext.gitSummary) : undefined,
+    sessionContext: validateObservedSessionContext(parsed.sessionContext, observedContext.sessionHistory),
+  };
+}
+
+function sanitizeObservedGitContext(gitSummary: GitSummaryPayload | undefined): GitContext | undefined {
+  if (!gitSummary) return undefined;
+  const branch = normalizeInlineText(gitSummary.branch, 200);
+  const statusSummary = normalizeInlineText(gitSummary.statusSummary, MAX_GIT_SUMMARY_CHARS);
+  const changedFiles = normalizeStringArray(gitSummary.changedFiles, MAX_CHANGED_FILES, 300)
+    .filter(isSafeRepoRelativePathCandidate);
+  const diffSummary = normalizeInlineText(gitSummary.diffSummary, MAX_GIT_DIFF_CHARS);
+
+  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary) return undefined;
+
+  return {
+    branch: branch || undefined,
+    statusSummary: statusSummary || undefined,
+    changedFiles: changedFiles.length > 0 ? changedFiles : undefined,
+    diffSummary: diffSummary || undefined,
+  };
+}
+
+function validateObservedSessionContext(
+  requestedContext: SessionContext | undefined,
+  observedHistory: BrowseSessionHistoryMessage[],
+): SessionContext | undefined {
+  if (!requestedContext?.relevantMessages.length) return undefined;
+
+  const observed = new Set(
+    observedHistory.map((message) => `${message.role}\0${normalizeInlineText(message.text, MAX_SELECTED_MESSAGE_CHARS)}`),
+  );
+  const relevantMessages = requestedContext.relevantMessages.filter((message) => {
+    return observed.has(`${message.role}\0${normalizeInlineText(message.text, MAX_SELECTED_MESSAGE_CHARS)}`);
+  });
+
+  return relevantMessages.length > 0 ? { relevantMessages } : undefined;
 }
 
 async function sanitizeRefs(parsedRefs: ParsedRef[], cwd: string, maxRefs: number): Promise<Ref[]> {
@@ -304,6 +731,10 @@ function describeToolExecution(toolName: string, args: unknown): string {
       return "Exploring indexed code graph…";
     case "codegraph_node":
       return "Inspecting code graph node…";
+    case INTERNAL_GIT_TOOL_NAME:
+      return "Inspecting git context…";
+    case INTERNAL_SESSION_HISTORY_TOOL_NAME:
+      return "Reading session history…";
     default:
       return `Using ${toolName}…`;
   }
@@ -331,6 +762,182 @@ function filterSafeBrowseTools(tools: string[]): string[] {
 function normalizeMaxRefs(maxRefs: number): number {
   if (!Number.isFinite(maxRefs)) return DEFAULT_MAX_REFS;
   return Math.max(1, Math.floor(maxRefs));
+}
+
+function normalizeSessionHistorySnapshot(sessionHistory: BrowseSessionHistoryMessage[]): BrowseSessionHistoryMessage[] {
+  const normalized: BrowseSessionHistoryMessage[] = [];
+  let totalChars = 0;
+
+  for (let i = sessionHistory.length - 1; i >= 0; i--) {
+    const message = sessionHistory[i];
+    if (!message || (message.role !== "user" && message.role !== "assistant")) continue;
+    const text = normalizeMultilineText(message.text, MAX_HISTORY_MESSAGE_CHARS);
+    if (!text) continue;
+
+    if (normalized.length >= MAX_HISTORY_SNAPSHOT_MESSAGES) break;
+    if (totalChars + text.length > MAX_HISTORY_TOTAL_CHARS) break;
+
+    normalized.unshift({ role: message.role, text });
+    totalChars += text.length;
+  }
+
+  return normalized;
+}
+
+function normalizeInlineText(value: unknown, maxChars: number): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/\x00/g, "")
+    .replace(/[\x01-\x08]/g, "")
+    .replace(/[\x0B]/g, "")
+    .replace(/[\x0C]/g, "")
+    .replace(/[\x0E-\x1F]/g, "")
+    .replace(/[\x7F]/g, "")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, maxChars);
+}
+
+function normalizeMultilineText(value: unknown, maxChars: number): string {
+  if (typeof value !== "string") return "";
+  return value
+    .replace(/\x00/g, "")
+    .replace(/[\x01-\x08]/g, "")
+    .replace(/[\x0B]/g, "")
+    .replace(/[\x0C]/g, "")
+    .replace(/[\x0E-\x1F]/g, "")
+    .replace(/[\x7F]/g, "")
+    .trim()
+    .slice(0, maxChars);
+}
+
+function normalizeStringArray(value: unknown, maxItems: number, maxCharsPerItem: number): string[] {
+  if (!Array.isArray(value)) return [];
+  const normalized: string[] = [];
+  for (const item of value) {
+    const text = normalizeInlineText(item, maxCharsPerItem);
+    if (!text) continue;
+    normalized.push(text);
+    if (normalized.length >= maxItems) break;
+  }
+  return normalized;
+}
+
+function normalizePathList(value: unknown): string[] | undefined {
+  const paths = normalizeStringArray(value, MAX_CHANGED_FILES, 400)
+    .filter(isSafeRepoRelativePathCandidate);
+  return paths.length > 0 ? paths : undefined;
+}
+
+function isSafeRepoRelativePathCandidate(path: string): boolean {
+  if (!path || path.includes("\0")) return false;
+  if (path.startsWith(":")) return false;
+  if (isAbsolute(path)) return false;
+  const segments = path.split(/[\\/]+/);
+  return segments.every((segment) => segment !== ".." && segment !== "");
+}
+
+function normalizeBoundedNumber(value: unknown, fallback: number, max: number): number {
+  if (typeof value !== "number" || !Number.isFinite(value)) return fallback;
+  return Math.max(1, Math.min(max, Math.floor(value)));
+}
+
+function summarizeStatus(porcelain: string): string {
+  const { staged, unstaged, untracked } = categorizeStatusLines(porcelain);
+  const parts: string[] = [];
+  if (staged.length > 0) parts.push(`${staged.length} staged`);
+  if (unstaged.length > 0) parts.push(`${unstaged.length} unstaged`);
+  if (untracked.length > 0) parts.push(`${untracked.length} untracked`);
+  return parts.length > 0 ? `${parts.join(", ")} files.` : "Working tree clean.";
+}
+
+function collectChangedFiles(porcelain: string): string[] {
+  const { staged, unstaged, untracked } = categorizeStatusLines(porcelain);
+  return uniqueStrings([...staged, ...unstaged, ...untracked]).slice(0, MAX_CHANGED_FILES);
+}
+
+function summarizeDiffStats(workingTreeStat: string, stagedStat: string): string | undefined {
+  const parts: string[] = [];
+  const working = normalizeInlineText(workingTreeStat, MAX_GIT_DIFF_CHARS);
+  const staged = normalizeInlineText(stagedStat, MAX_GIT_DIFF_CHARS);
+  if (working) parts.push(`unstaged: ${working}`);
+  if (staged) parts.push(`staged: ${staged}`);
+  const summary = parts.join(" | ");
+  return summary ? summary.slice(0, MAX_GIT_DIFF_CHARS) : undefined;
+}
+
+function categorizeStatusLines(porcelain: string): { staged: string[]; unstaged: string[]; untracked: string[] } {
+  const staged: string[] = [];
+  const unstaged: string[] = [];
+  const untracked: string[] = [];
+
+  for (const rawLine of porcelain.split(/\r?\n/)) {
+    const line = rawLine.trimEnd();
+    if (!line) continue;
+    const x = line[0] ?? " ";
+    const y = line[1] ?? " ";
+    const path = extractStatusPath(line.slice(3));
+    if (!path) continue;
+
+    if (x === "?" && y === "?") {
+      untracked.push(path);
+      continue;
+    }
+    if (x !== " ") staged.push(path);
+    if (y !== " ") unstaged.push(path);
+  }
+
+  return {
+    staged: uniqueStrings(staged),
+    unstaged: uniqueStrings(unstaged),
+    untracked: uniqueStrings(untracked),
+  };
+}
+
+function extractStatusPath(rawPath: string): string {
+  const trimmed = rawPath.trim();
+  if (!trimmed) return "";
+  const renamedPath = trimmed.includes(" -> ") ? trimmed.split(" -> ").at(-1) ?? trimmed : trimmed;
+  return normalizeInlineText(renamedPath, 400);
+}
+
+function uniqueStrings(values: string[]): string[] {
+  return [...new Set(values.filter(Boolean))];
+}
+
+function truncateBytes(value: string, maxBytes: number): string {
+  if (Buffer.byteLength(value, "utf8") <= maxBytes) return value;
+
+  let low = 0;
+  let high = value.length;
+  let best = "";
+
+  while (low <= high) {
+    const mid = Math.floor((low + high) / 2);
+    const candidate = value.slice(0, mid);
+    if (Buffer.byteLength(candidate, "utf8") <= maxBytes) {
+      best = candidate;
+      low = mid + 1;
+      continue;
+    }
+    high = mid - 1;
+  }
+
+  return best;
+}
+
+function truncateLinesAndBytes(value: string, maxLines: number, maxBytes: number): { content: string; truncated: boolean } {
+  const normalized = value.trim();
+  if (!normalized) return { content: "", truncated: false };
+
+  const lines = normalized.split(/\r?\n/);
+  const limitedLines = lines.slice(0, maxLines);
+  let content = truncateBytes(limitedLines.join("\n"), maxBytes);
+  const truncated = limitedLines.length < lines.length || content.length < normalized.length;
+  if (truncated) {
+    content = `${content}\n\n[truncated]`.trim();
+  }
+  return { content, truncated };
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

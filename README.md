@@ -9,7 +9,8 @@ Generate or rewrite prompts inside Pi with a modal prompt enhancer.
 - runs a real read-only browse pass before enhancement to inspect the codebase
 - reuses the currently selected Pi model for both browsing and final prompt generation
 - can use a safe local browse-tool subset when those tools are available in Pi: `read`, `grep`, `find`, `ls`, `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, and `codegraph_status`
-- keeps enhancement calls isolated from the parent session history and session id
+- adds internal bounded read-only browse tools for current git context and current-branch user/assistant session history
+- keeps enhancement calls isolated from the parent session id and does not reuse full parent history
 - stays strictly in prompt-generation mode instead of solving the underlying task
 
 ## Install
@@ -79,11 +80,19 @@ Default mode:
 
 ## Browse pass
 
-Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated read-only browse pass when safe local browse tools are available. That pass can:
+Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated read-only browse pass. That pass can:
 
-- inspect the repository with read-only file tools: `read`, `grep`, `find`, `ls`
+- inspect the repository with read-only file tools when available: `read`, `grep`, `find`, `ls`
 - use local code and project-discovery tools when available: `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, `codegraph_status`
-- select a small set of relevant file refs to inject into the final prompt
+- inspect bounded current git context through an internal read-only `git_context` tool
+- inspect bounded current-branch user/assistant conversation history through an internal read-only `session_history` tool
+- select a small set of relevant file refs plus concise structured git/session context to inject into the final prompt
+
+The internal browse-only tools are bounded on purpose:
+
+- `git_context` is read-only and limited to branch/status/diff-style inspection for the current repository
+- `session_history` only exposes current-branch user/assistant messages, not tool chatter or full session-tree state
+- the final enhancement call receives only the scout's small structured output, not raw full diffs or full conversation history
 
 When that browse pass runs, the modal shows progress and the inline command path shows footer status updates so you can see when it is examining the codebase, using tools, and generating the final prompt.
 
@@ -123,8 +132,9 @@ The enhancement pipeline uses explicit inputs only:
 - the current cwd for the isolated browse pass
 - the raw user draft as the user message
 - the rewrite/generate guardrail harness as the system prompt
+- a bounded structured browse result: relevant file refs plus optional concise git/session context selected by the scout
 
-It does **not** reuse the parent session history or parent session id.
+It does **not** reuse the parent session id, parent session history wholesale, or the full conversation tree.
 
 ## Non-TUI behavior
 

@@ -63,6 +63,7 @@ vi.mock("@earendil-works/pi-coding-agent", () => ({
     })),
   },
   createAgentSession: mockCreateAgentSession,
+  defineTool: vi.fn((tool) => tool),
   getAgentDir: vi.fn(() => "/mock-agent-dir"),
 }));
 
@@ -133,12 +134,15 @@ describe("browseCodebase", () => {
   it("creates the isolated browse session with extensions and context files disabled", async () => {
     const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
 
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
       apiKey: "sk-test",
       tools: ["read", "grep"],
+      sessionHistory: [
+        { role: "user", text: "Look into the current prompt generator limitations." },
+      ],
     });
 
     expect(loaderOptions[0]).toEqual(expect.objectContaining({
@@ -150,14 +154,18 @@ describe("browseCodebase", () => {
     }));
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       thinkingLevel: "off",
-      tools: ["read", "grep"],
+      tools: ["read", "grep", "git_context", "session_history"],
+      customTools: expect.arrayContaining([
+        expect.objectContaining({ name: "git_context" }),
+        expect.objectContaining({ name: "session_history" }),
+      ]),
     }));
-    expect(refs).toEqual([
+    expect(result.refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
   });
 
-  it("filters unsafe tools before creating the temporary agent session", async () => {
+  it("filters unsafe tools before creating the temporary agent session while keeping internal browse tools", async () => {
     const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
 
     await browseCodebase({
@@ -169,7 +177,7 @@ describe("browseCodebase", () => {
     });
 
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
-      tools: ["read", "code_search"],
+      tools: ["read", "code_search", "git_context"],
     }));
   });
 
@@ -199,7 +207,7 @@ describe("browseCodebase", () => {
       },
     ];
 
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
@@ -207,10 +215,109 @@ describe("browseCodebase", () => {
       tools: ["read"],
     });
 
-    expect(refs).toEqual([
+    expect(result.refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
       { path: "src/other.ts", score: 50, isEntrypoint: false },
     ]);
+  });
+
+  it("validates structured session context against observed bounded history and rejects unobserved git context", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    mockSession.messages = [
+      {
+        role: "assistant",
+        content: [
+          {
+            type: "text",
+            text: JSON.stringify({
+              refs: [{ path: "src/index.ts", score: 97, isEntrypoint: true }],
+              gitContext: {
+                branch: "hallucinated-branch",
+                statusSummary: "999 unstaged files.",
+                changedFiles: ["made-up.ts"],
+                diffSummary: "Made-up diff summary.",
+              },
+              sessionContext: {
+                relevantMessages: [
+                  { role: "user", text: "Please make the prompt generator understand follow-up work." },
+                  { role: "assistant", text: "Hallucinated prior answer." },
+                ],
+              },
+            }),
+          },
+        ],
+      },
+    ];
+
+    const result = await browseCodebase({
+      input: "improve follow-up prompt generation",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      sessionHistory: [
+        { role: "user", text: "Please make the prompt generator understand follow-up work." },
+      ],
+    });
+
+    expect(result.gitContext).toBeUndefined();
+    expect(result.sessionContext).toEqual({
+      relevantMessages: [
+        { role: "user", text: "Please make the prompt generator understand follow-up work." },
+      ],
+    });
+  });
+
+  it("session_history exposes a bounded latest current-branch snapshot", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+    const sessionHistory = Array.from({ length: 45 }, (_, index) => ({
+      role: "user" as const,
+      text: `message ${index}`,
+    }));
+
+    await browseCodebase({
+      input: "use recent context",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+      sessionHistory,
+    });
+
+    const createCalls = mockCreateAgentSession.mock.calls as unknown as Array<[{ customTools: any[] }]>;
+    const customTools = createCalls[0][0].customTools;
+    const sessionHistoryTool = customTools.find((tool) => tool.name === "session_history");
+    const result = await sessionHistoryTool.execute("tool-call", { offset: 0, limit: 10 });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload.messages[0]).toEqual({ index: 0, role: "user", text: "message 5" });
+    expect(payload.messages.at(-1)).toEqual({ index: 9, role: "user", text: "message 14" });
+    expect(payload.page.total).toBe(40);
+  });
+
+  it("git_context rejects pathspec magic instead of broadening a requested path-filtered diff", async () => {
+    const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
+
+    await browseCodebase({
+      input: "inspect git diff",
+      cwd: repo,
+      model: makeModel(),
+      apiKey: "sk-test",
+      tools: ["read"],
+    });
+
+    const createCalls = mockCreateAgentSession.mock.calls as unknown as Array<[{ customTools: any[] }]>;
+    const customTools = createCalls[0][0].customTools;
+    const gitTool = customTools.find((tool) => tool.name === "git_context");
+    const result = await gitTool.execute("tool-call", { action: "diff", paths: [":/"] });
+    const payload = JSON.parse(result.content[0].text);
+
+    expect(payload).toEqual({
+      scope: "working_tree",
+      diff: "",
+      truncated: false,
+      paths: [],
+    });
   });
 
   it("normalizes non-finite maxRefs before building prompts and limiting refs", async () => {
@@ -235,7 +342,7 @@ describe("browseCodebase", () => {
       },
     ];
 
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
@@ -245,7 +352,7 @@ describe("browseCodebase", () => {
     });
 
     expect(mockPrompt).toHaveBeenCalledWith(expect.stringContaining("at most 5 file refs"));
-    expect(refs).toHaveLength(2);
+    expect(result.refs).toHaveLength(2);
   });
 
   it("rounds down fractional maxRefs before limiting refs", async () => {
@@ -270,7 +377,7 @@ describe("browseCodebase", () => {
       },
     ];
 
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
@@ -280,7 +387,7 @@ describe("browseCodebase", () => {
     });
 
     expect(mockPrompt).toHaveBeenCalledWith(expect.stringContaining("at most 1 file refs"));
-    expect(refs).toEqual([
+    expect(result.refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
   });
@@ -306,7 +413,7 @@ describe("browseCodebase", () => {
       },
     ];
 
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
@@ -314,12 +421,12 @@ describe("browseCodebase", () => {
       tools: ["read"],
     });
 
-    expect(refs).toEqual([
+    expect(result.refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
   });
 
-  it("reports tool progress and parses fenced JSON responses", async () => {
+  it("reports tool progress for repo, git, and session-history tools and parses fenced JSON responses", async () => {
     const repo = await makeRepo({ "src/index.ts": "export const ok = true;" });
     mockSession.messages = [
       {
@@ -337,25 +444,32 @@ describe("browseCodebase", () => {
       },
     ];
     mockPrompt.mockImplementation(async () => {
+      toolEventListener?.({ type: "tool_execution_start", toolName: "git_context", args: { action: "summary" } });
+      toolEventListener?.({ type: "tool_execution_start", toolName: "session_history", args: { limit: 2 } });
       toolEventListener?.({ type: "tool_execution_start", toolName: "read", args: { path: "src/index.ts" } });
     });
 
     const onProgress = vi.fn();
-    const refs = await browseCodebase({
+    const result = await browseCodebase({
       input: "fix sidebar sorting",
       cwd: repo,
       model: makeModel(),
       apiKey: "sk-test",
       tools: ["read"],
+      sessionHistory: [
+        { role: "user", text: "Please use the latest conversation context if needed." },
+      ],
       onProgress,
     });
 
     expect(onProgress.mock.calls.map((call) => call[0])).toEqual(expect.arrayContaining([
       "Examining codebase…",
+      "Inspecting git context…",
+      "Reading session history…",
       "Reading src/index.ts…",
       "Selecting useful references…",
     ]));
-    expect(refs).toEqual([
+    expect(result.refs).toEqual([
       { path: "src/index.ts", score: 97, isEntrypoint: true },
     ]);
   });

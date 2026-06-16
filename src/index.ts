@@ -3,7 +3,8 @@
  *
  * Wires the prompt-builder and isolated final model call together.
  * Repo/context examination now happens outside this file via an isolated
- * read-only browse pass that can provide explicit refs.
+ * read-only browse pass that can provide explicit refs plus bounded git and
+ * session context.
  */
 
 import type { Api, Model } from "@earendil-works/pi-ai";
@@ -24,6 +25,29 @@ export interface Ref {
   isEntrypoint: boolean;
   /** Optional line count if the browse pass captured it. */
   lineCount?: number;
+}
+
+/** Bounded git context selected by the upstream browse scout. */
+export interface GitContext {
+  /** Current git branch name if the scout found one. */
+  branch?: string;
+  /** Concise working-tree summary selected by the scout. */
+  statusSummary?: string;
+  /** Small bounded set of changed files worth referencing in the final prompt. */
+  changedFiles?: string[];
+  /** Concise diff summary distilled by the scout. */
+  diffSummary?: string;
+}
+
+/** One user/assistant message excerpt selected by the browse scout. */
+export interface SessionContextMessage {
+  role: "user" | "assistant";
+  text: string;
+}
+
+/** Bounded conversation context selected by the upstream browse scout. */
+export interface SessionContext {
+  relevantMessages: SessionContextMessage[];
 }
 
 /** All options accepted by the composed enhancePrompt() function. */
@@ -52,6 +76,10 @@ export interface EnhancePromptOptions {
   previousOutput?: string;
   /** Optional explicit refs gathered by an upstream browse pass. */
   relevantRefs?: Ref[];
+  /** Optional bounded git context gathered by an upstream browse pass. */
+  gitContext?: GitContext;
+  /** Optional bounded conversation context gathered by an upstream browse pass. */
+  sessionContext?: SessionContext;
 }
 
 /** Structured result returned by enhancePrompt(). */
@@ -60,9 +88,13 @@ export interface EnhancePromptResult {
   enhancedPrompt: string;
   /** Explicit refs that were provided and injected as scoped context. */
   refs: Ref[];
+  /** Optional bounded git context that was injected into the prompt harness. */
+  gitContext?: GitContext;
+  /** Optional bounded conversation context that was injected into the prompt harness. */
+  sessionContext?: SessionContext;
   /**
    * The complete system prompt that was sent to the model. Includes the
-   * role, mode instruction, guardrails, and scoped ref context only.
+   * role, mode instruction, guardrails, and scoped context only.
    * Raw user input stays in the user message. Useful for debugging.
    */
   systemPrompt: string;
@@ -73,7 +105,7 @@ export interface EnhancePromptResult {
 /**
  * Run the prompt-shaping pipeline:
  *
- *   explicit refs → buildEnhancerPrompt() → makeModelCall()
+ *   explicit browse context → buildEnhancerPrompt() → makeModelCall()
  *
  * Every model call runs in isolated ephemeral context — no parent session id
  * is forwarded, no conversation history is attached, and only the supplied
@@ -89,6 +121,8 @@ export async function enhancePrompt(options: EnhancePromptOptions): Promise<Enha
     signal,
     previousOutput,
     relevantRefs,
+    gitContext,
+    sessionContext,
   } = options;
 
   const refs: Ref[] = relevantRefs ?? [];
@@ -99,6 +133,8 @@ export async function enhancePrompt(options: EnhancePromptOptions): Promise<Enha
     mode,
     relevantRefs: refPaths.length > 0 ? refPaths : undefined,
     entryPoint,
+    gitContext,
+    sessionContext,
   });
 
   const modelResult = await makeModelCall({
@@ -113,6 +149,8 @@ export async function enhancePrompt(options: EnhancePromptOptions): Promise<Enha
   return {
     enhancedPrompt: modelResult.content,
     refs,
+    gitContext,
+    sessionContext,
     systemPrompt,
     modelResult,
   };

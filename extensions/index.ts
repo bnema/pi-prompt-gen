@@ -6,7 +6,7 @@
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
-import { browseCodebase, SAFE_BROWSE_TOOL_NAMES } from "../src/browse-pass.js";
+import { browseCodebase, SAFE_BROWSE_TOOL_NAMES, type BrowseSessionHistoryMessage } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
 import { PromptGenModal } from "../src/modal.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
@@ -167,7 +167,7 @@ function createEnhanceFn(
   ) => {
     throwIfAborted(signal);
 
-    const refs = ctx.cwd && browseTools.length > 0
+    const browseResult = ctx.cwd
       ? await browseCodebase({
         input: text,
         cwd: ctx.cwd,
@@ -176,9 +176,10 @@ function createEnhanceFn(
         headers: config.headers,
         signal,
         tools: browseTools,
+        sessionHistory: resolveBrowseSessionHistory(ctx.sessionManager),
         onProgress,
       })
-      : [];
+      : { refs: [] };
 
     throwIfAborted(signal);
     onProgress?.("Generating enhanced prompt…");
@@ -191,7 +192,9 @@ function createEnhanceFn(
       headers: config.headers,
       signal,
       previousOutput,
-      relevantRefs: refs,
+      relevantRefs: browseResult.refs,
+      gitContext: browseResult.gitContext,
+      sessionContext: browseResult.sessionContext,
     });
   };
 }
@@ -290,6 +293,30 @@ function extractMessageText(content: unknown): string {
     .filter(Boolean)
     .join("\n")
     .trim();
+}
+
+function resolveBrowseSessionHistory(
+  sessionManager: Pick<ExtensionCommandContext, "sessionManager">["sessionManager"],
+): BrowseSessionHistoryMessage[] {
+  // Browse history must stay scoped to the current branch. Prefill can fall
+  // back to getEntries(), but the internal session_history tool should not
+  // risk exposing unrelated session-tree entries when getBranch() is absent.
+  const branchEntries = typeof sessionManager?.getBranch === "function"
+    ? sessionManager.getBranch()
+    : [];
+
+  const messages: BrowseSessionHistoryMessage[] = [];
+  for (const entry of branchEntries) {
+    const messageEntry = entry as { type?: string; message?: { role?: string; content?: unknown } };
+    if (messageEntry?.type !== "message") continue;
+    const role = messageEntry.message?.role;
+    if (role !== "user" && role !== "assistant") continue;
+    const text = extractMessageText(messageEntry.message?.content);
+    if (!text) continue;
+    messages.push({ role, text });
+  }
+
+  return messages;
 }
 
 // ---------------------------------------------------------------------------
