@@ -127,6 +127,7 @@ describe("enhancePrompt (composed core path)", () => {
     expect(params.userContent).toContain("Previous draft to avoid repeating verbatim:");
     expect(params.userContent).toContain("Previous polished prompt");
     expect(params.userContent).toContain("Produce a materially different alternative");
+    expect(params.userContent).toContain("Vary the wording or structure");
   });
 
   it("passes headers and signal through to makeModelCall", async () => {
@@ -257,5 +258,169 @@ describe("enhancePrompt (composed core path)", () => {
 
     const params = mockMakeModelCall.mock.calls[0][0] as { systemPrompt: string };
     expect(params.systemPrompt).not.toContain("fix the sidebar sort order");
+  });
+
+  it("propagates rich ref metadata (reason, role, symbols) through the pipeline", async () => {
+    const result = await enhancePrompt(makeBasicOptions({
+      relevantRefs: [
+        {
+          path: "src/sidebar.ts",
+          score: 97,
+          isEntrypoint: false,
+          reason: "Main sidebar component",
+          role: "implementation",
+          symbols: ["Sidebar"],
+        },
+      ],
+    }));
+
+    expect(result.refs).toEqual([
+      {
+        path: "src/sidebar.ts",
+        score: 97,
+        isEntrypoint: false,
+        reason: "Main sidebar component",
+        role: "implementation",
+        symbols: ["Sidebar"],
+      },
+    ]);
+    expect(result.systemPrompt).toContain("src/sidebar.ts");
+    expect(result.systemPrompt).toContain("Main sidebar component");
+    expect(result.systemPrompt).toContain("implementation");
+    expect(result.systemPrompt).toContain("Sidebar");
+  });
+
+  it("passes through changedFileDetails in gitContext to the system prompt", async () => {
+    const result = await enhancePrompt(makeBasicOptions({
+      gitContext: {
+        branch: "feat/test",
+        statusSummary: "1 staged, 1 untracked files.",
+        changedFileDetails: [
+          { path: "src/index.ts", status: "modified", staged: true, unstaged: false, untracked: false, additions: 3, deletions: 1 },
+          { path: "src/new.ts", status: "unknown", staged: false, unstaged: false, untracked: true },
+        ],
+      },
+    }));
+
+    expect(result.gitContext?.changedFileDetails).toBeDefined();
+    expect(result.gitContext?.changedFileDetails).toHaveLength(2);
+    expect(result.systemPrompt).toContain("src/index.ts");
+    expect(result.systemPrompt).toContain("modified");
+    expect(result.systemPrompt).toContain("+3/-1");
+    expect(result.systemPrompt).toContain("src/new.ts");
+    expect(result.systemPrompt).toContain("untracked");
+  });
+
+  it("returns empty changedFileDetails when gitContext is provided without changedFileDetails", async () => {
+    const result = await enhancePrompt(makeBasicOptions({
+      gitContext: {
+        branch: "feat/test",
+        changedFiles: ["src/legacy.ts"],
+      },
+    }));
+
+    expect(result.gitContext?.changedFileDetails).toBeUndefined();
+    expect(result.gitContext?.changedFiles).toEqual(["src/legacy.ts"]);
+    // Changed files rendering falls back to simple list
+    expect(result.systemPrompt).toContain("src/legacy.ts");
+    expect(result.systemPrompt).toContain("- Changed files:");
+  });
+
+  // =======================================================================
+  // Metadata propagation
+  // =======================================================================
+
+  it("returns metadata with modelId, modelName, modelProvider from options", async () => {
+    const model = makeFakeModel({ id: "custom-model", name: "Custom Model", provider: "custom-provider" });
+    const result = await enhancePrompt(makeBasicOptions({ model }));
+
+    expect(result.metadata.modelId).toBe("custom-model");
+    expect(result.metadata.modelName).toBe("Custom Model");
+    expect(result.metadata.modelProvider).toBe("custom-provider");
+  });
+
+  it("returns metadata with latencyMs as a positive number", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+
+    expect(result.metadata.latencyMs).toBeGreaterThanOrEqual(0);
+    expect(typeof result.metadata.latencyMs).toBe("number");
+  });
+
+  it("returns metadata with refCount matching refs.length", async () => {
+    const result = await enhancePrompt(makeBasicOptions({
+      relevantRefs: [
+        { path: "src/a.ts", score: 50, isEntrypoint: false },
+        { path: "src/b.ts", score: 60, isEntrypoint: true },
+      ],
+    }));
+
+    expect(result.metadata.refCount).toBe(2);
+    expect(result.metadata.refCount).toBe(result.refs.length);
+  });
+
+  it("returns metadata with refCount 0 when no refs provided", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+    expect(result.metadata.refCount).toBe(0);
+  });
+
+  it("returns metadata with stopReason from modelResult", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+    expect(result.metadata.stopReason).toBe("stop");
+    expect(result.metadata.stopReason).toBe(result.modelResult.stopReason);
+  });
+
+  it("returns metadata with usageSummary from modelResult usage", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+
+    expect(result.metadata.usageSummary).toBeDefined();
+    expect(result.metadata.usageSummary!.input).toBe(50);
+    expect(result.metadata.usageSummary!.output).toBe(30);
+    expect(result.metadata.usageSummary!.totalTokens).toBe(80);
+  });
+
+  it("returns metadata without extension-owned browseToolsUsed", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+    expect(result.metadata.browseToolsUsed).toBeUndefined();
+  });
+
+  it("does not include cost information in usageSummary", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+
+    expect(result.metadata.usageSummary).toBeDefined();
+    // cost property must not leak into the summary
+    expect("cost" in (result.metadata.usageSummary ?? {})).toBe(false);
+  });
+
+  it("metadata does not contain raw user input or API keys", async () => {
+    const result = await enhancePrompt(makeBasicOptions({
+      input: "secret-project-fix",
+      apiKey: "sk-do-not-leak",
+    }));
+
+    const serialised = JSON.stringify(result.metadata);
+    expect(serialised).not.toContain("secret-project-fix");
+    expect(serialised).not.toContain("sk-do-not-leak");
+  });
+
+  it("metadata shape is stable when usage is absent (undefined usageSummary)", async () => {
+    mockMakeModelCall.mockResolvedValueOnce({
+      content: "No usage response.",
+      stopReason: "stop",
+    });
+
+    const result = await enhancePrompt(makeBasicOptions());
+
+    expect(result.metadata.usageSummary).toBeUndefined();
+    expect(result.metadata.stopReason).toBe("stop");
+    expect(result.metadata.refCount).toBe(0);
+    expect(typeof result.metadata.latencyMs).toBe("number");
+  });
+
+  it("metadata is always present on the result", async () => {
+    const result = await enhancePrompt(makeBasicOptions());
+    expect(result).toHaveProperty("metadata");
+    expect(result.metadata).toHaveProperty("refCount");
+    expect(result.metadata).toHaveProperty("latencyMs");
+    expect(result.metadata).toHaveProperty("stopReason");
   });
 });

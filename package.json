@@ -26,6 +26,7 @@
     "dist/",
     "extensions/",
     "src/",
+    "docs/",
     "README.md",
     "LICENSE"
   ],
@@ -38,6 +39,7 @@
     "build": "tsc -p tsconfig.build.json",
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
+    "verify": "npm run typecheck && npm test && npm run build",
     "prepack": "npm run build"
   },
   "peerDependencies": {

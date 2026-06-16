@@ -185,6 +185,14 @@ beforeEach(() => {
     sessionContext: undefined,
     systemPrompt: "",
     modelResult: { content: "Enhanced result text", stopReason: "stop" },
+    metadata: {
+      modelId: "test-model",
+      modelName: "Test Model",
+      modelProvider: "test-provider",
+      latencyMs: 500,
+      refCount: 0,
+      stopReason: "stop",
+    },
   });
 });
 
@@ -442,6 +450,63 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     );
   });
 
+  it("inline success notification includes metadata summary (model, stop, latency)", async () => {
+    // The mock result in beforeEach has metadata with modelName, stopReason,
+    // latencyMs but no usageSummary — only model, stop, and latency appear.
+    const ctx = makeMockContext({
+      mode: "print",
+      hasUI: true,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test input", ctx);
+
+    // The notify message should contain the metadata summary
+    const infoCalls = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => call[1] === "info"
+    );
+    const lastInfoCall = infoCalls[infoCalls.length - 1];
+    expect(lastInfoCall).toBeDefined();
+    expect(lastInfoCall[0]).toContain("Test Model");
+    expect(lastInfoCall[0]).toContain("stop");
+    expect(lastInfoCall[0]).toContain("0.5s");
+    // No token info since usageSummary is absent in the mock
+    expect(lastInfoCall[0]).not.toContain("tok");
+  });
+
+  it("inline notification omits metadata summary fields when absent", async () => {
+    mockEnhancePrompt.mockResolvedValueOnce({
+      enhancedPrompt: "No metadata result",
+      refs: [],
+      systemPrompt: "",
+      modelResult: { content: "No metadata result", stopReason: "stop" },
+      metadata: {
+        refCount: 0,
+      },
+    });
+    const ctx = makeMockContext({
+      mode: "print",
+      hasUI: true,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("test input", ctx);
+
+    // Should still succeed with a basic notification
+    const infoCalls = (ctx.ui.notify as ReturnType<typeof vi.fn>).mock.calls.filter(
+      (call: unknown[]) => call[1] === "info"
+    );
+    const lastInfoCall = infoCalls[infoCalls.length - 1];
+    expect(lastInfoCall).toBeDefined();
+    expect(lastInfoCall[0]).toContain("copied to clipboard");
+    // No metadata segments since fields are absent
+    expect(lastInfoCall[0]).not.toContain("·");
+  });
+
   it("warns specifically when inline clipboard copy fails after enhancement succeeds", async () => {
     vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
 
@@ -485,7 +550,10 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
       "Enhanced prompt ready, but failed to write to editor.",
       "warning",
     );
-    expect(ctx.ui.notify).toHaveBeenCalledWith("Enhanced prompt copied to clipboard.", "info");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      expect.stringContaining("Enhanced prompt copied to clipboard"),
+      "info",
+    );
     expect(ctx.ui.notify).not.toHaveBeenCalledWith(expect.stringContaining("Enhancement failed"), "error");
   });
 
@@ -617,7 +685,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    await modalOptions.enhanceFn("my text", "generate");
+    const enhanced = await modalOptions.enhanceFn("my text", "generate");
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       input: "my text",
@@ -651,6 +719,19 @@ describe("Command handler — enhance function wrapper", () => {
         ],
       },
     }));
+    expect((enhancePrompt as ReturnType<typeof vi.fn>).mock.calls[0][0]).not.toHaveProperty("browseToolsUsed");
+    expect(enhanced.metadata.browseToolsUsed).toEqual([
+      "read",
+      "grep",
+      "find",
+      "ls",
+      "code_search",
+      "project_memory_read",
+      "project_memory_search",
+      "codegraph_explore",
+      "codegraph_node",
+      "codegraph_status",
+    ]);
   });
 
   it("passes a progress callback into the browse pass", async () => {

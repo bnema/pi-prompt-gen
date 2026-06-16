@@ -64,6 +64,15 @@ function makeEnhanceResult(overrides?: Partial<EnhancePromptResult>): EnhancePro
       stopReason: "stop",
       responseModel: "test-model",
     },
+    metadata: {
+      modelId: "test-model",
+      modelName: "Test Model",
+      modelProvider: "test-provider",
+      latencyMs: 800,
+      refCount: 1,
+      stopReason: "stop",
+      usageSummary: { input: 50, output: 30, totalTokens: 80 },
+    },
     ...overrides,
   };
 }
@@ -848,6 +857,7 @@ describe("PromptGenModal render output", () => {
     // Secondary actions still shown
     expect(joined).toContain("[Alt+R] Regenerate");
     expect(joined).toContain("[Alt+Y] Copy");
+    expect(joined).toContain("[Alt+E] Meta");
     expect(joined).toContain("[Alt+A] Apply");
     expect(joined).toContain("[Alt+S] Send");
   });
@@ -868,6 +878,7 @@ describe("PromptGenModal render output", () => {
       expect(joined).toContain("[Enter] Re-enhance");
       expect(joined).toContain("[Alt+R] Alternative");
       expect(joined).toContain("[Alt+Y] Copy");
+      expect(joined).toContain("[Alt+E] Meta");
       expect(joined).toContain("[Alt+A] Apply");
       expect(joined).toContain("[Alt+S] Send");
     });
@@ -923,6 +934,55 @@ describe("PromptGenModal render output", () => {
     });
   });
 
+  it("renders structured output (Goal/Context/Constraints/Verification sections) in preview within truncation bounds", async () => {
+    // 12 lines: first 10 visible, last 2 overflow → truncation message
+    const structuredPrompt = [
+      "Goal:",
+      "  Add a POST /api/users endpoint.",
+      "Context:",
+      "  src/api/routes/users.ts defines the route structure.",
+      "Constraints:",
+      "  - Validate email format.",
+      "  - Hash password.",
+      "Verification:",
+      "  - Returns 201 on success.",
+      "  - Rejects invalid email.",
+      "  - Password field excluded.",
+      "  - Duplicate email returns 409.",
+    ].join("\n");
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      enhancedPrompt: structuredPrompt,
+    }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "add post users endpoint with validation",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const lines = modal.render(80);
+      const joined = lines.join("\n");
+
+      // Section headers within preview height (10 lines):
+      // Goal: (line 1), Context: (line 3), Constraints: (line 5), Verification: (line 8)
+      expect(joined).toContain("Goal:");
+      expect(joined).toContain("Context:");
+      expect(joined).toContain("Constraints:");
+      expect(joined).toContain("Verification:");
+
+      // Content from each section visible
+      expect(joined).toContain("POST /api/users");
+      expect(joined).toContain("route structure");
+      expect(joined).toContain("Validate email");
+      expect(joined).toContain("Returns 201");
+
+      // Truncation for lines beyond preview (12 total − 10 visible = 2 overflow)
+      expect(joined).toContain("2 more lines");
+      expect(joined).toContain("actions use full result");
+    });
+  });
+
   it("shows result metadata with ref count and line count", async () => {
     const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
       refs: [{ path: "src/Sidebar.tsx", score: 65, isEntrypoint: true, lineCount: 120 }],
@@ -966,6 +1026,169 @@ describe("PromptGenModal render output", () => {
       // No ref bullet
       expect(joined).not.toContain("●");
     });
+  });
+
+  it("shows model name in metadata line", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      // Model name from makeEnhanceResult metadata
+      expect(joined).toContain("Test Model");
+    });
+  });
+
+  it("shows stop reason in metadata line", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      expect(joined).toContain("stop");
+    });
+  });
+
+  it("shows token count in metadata line", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      expect(joined).toContain("80 tok");
+    });
+  });
+
+  it("shows latency in metadata line", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      expect(joined).toContain("0.8s");
+    });
+  });
+
+  it("metadata line gracefully omits fields when metadata fields are absent", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      refs: [],
+      enhancedPrompt: "No metadata.",
+      metadata: {
+        refCount: 0,
+      },
+    }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      // Should still show line count even without model/tokens/latency
+      expect(joined).toContain("1 line");
+      // No model name
+      expect(joined).not.toContain("Test Model");
+      expect(joined).not.toContain("tok");
+      // No latency (would appear as X.Xs)
+      expect(joined).not.toMatch(/\d\.\ds/);
+    });
+  });
+
+  it("uses modelId as fallback when modelName is absent in metadata", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({
+      refs: [],
+      enhancedPrompt: "Result.",
+      metadata: {
+        modelId: "custom-model-id",
+        refCount: 0,
+        stopReason: "stop",
+        usageSummary: { input: 10, output: 5 },
+      },
+    }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      const joined = modal.render(80).join("\n");
+      // Falls back to modelId when modelName is absent
+      expect(joined).toContain("custom-model-id");
+    });
+  });
+
+  it("Alt+e copies debug artifact to clipboard", async () => {
+    const copyFn = vi.fn().mockResolvedValue(undefined);
+    const notifyFn = vi.fn();
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+      copyFn,
+      notifyFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      expect(modal.render(80).join("\n")).toContain("Enhanced");
+    });
+
+    press(modal, "\u001be"); // Alt+e
+    await vi.waitFor(() => {
+      expect(copyFn).toHaveBeenCalledTimes(1);
+      const artifact = copyFn.mock.calls[0][0];
+      expect(typeof artifact).toBe("string");
+      expect(artifact).toContain("=== pi-prompt-gen metadata artifact ===");
+      expect(artifact).toContain("Model");
+      expect(artifact).toContain("Test Model");
+      // Debug artifact shows total in Tokens table, not as "80 tok"
+      expect(artifact).toContain("total: 80");
+      expect(artifact).not.toContain("sk-");
+    });
+    expect(notifyFn).toHaveBeenCalledWith("Metadata artifact copied to clipboard.", "info");
+  });
+
+  it("Alt+e without enhancement shows warning", async () => {
+    const copyFn = vi.fn();
+    const notifyFn = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      copyFn,
+      notifyFn,
+    }));
+    bindModal(modal);
+
+    press(modal, "\u001be"); // Alt+e
+    expect(notifyFn).toHaveBeenCalledWith(
+      "No enhanced result to export. Enhance draft first.",
+      "warning",
+    );
+    expect(copyFn).not.toHaveBeenCalled();
   });
 });
 

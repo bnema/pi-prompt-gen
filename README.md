@@ -94,6 +94,36 @@ The internal browse-only tools are bounded on purpose:
 - `session_history` only exposes current-branch user/assistant messages, not tool chatter or full session-tree state
 - the final enhancement call receives only the scout's small structured output, not raw full diffs or full conversation history
 
+### Tool safety boundaries
+
+The browse pass uses an explicit allowlist (`SAFE_BROWSE_TOOL_NAMES` in
+`src/browse-pass.ts`) that restricts the external tools available to the
+scout model. Only read-only inspection tools are allowed:
+
+- File inspection: `read`, `grep`, `find`, `ls`
+- Code/documentation search: `code_search`
+- Project memory: `project_memory_read`, `project_memory_search`
+- Code graph: `codegraph_explore`, `codegraph_node`, `codegraph_status`
+
+**Excluded categories** (structural tests enforce these):
+
+| Category | Examples |
+|----------|----------|
+| Write/edit | `write`, `edit` |
+| Shell/execution | `bash`, `shell`, `execute`, `run`, `spawn` |
+| Network-heavy | `web_search`, `fetch`, `curl`, `wget` |
+| Infrastructure | `docker`, `kubectl`, `ssh` |
+| Package managers | `npm`, `npx`, `pnpm`, `yarn` |
+| Session-coupled (internal) | `session_history`, `git_context` |
+
+The internal read-only tools (`git_context`, `session_history`) are added
+separately from the external tool list and are not in the allowlist. They
+are bounded, read-only, and only expose a small structured snapshot.
+
+Adding any tool from an excluded category to `SAFE_BROWSE_TOOL_NAMES`
+requires deliberate review — the structural tests in
+`test/browse-pass.test.ts` will fail until the expected set is updated.
+
 When that browse pass runs, the modal shows progress and the inline command path shows footer status updates so you can see when it is examining the codebase, using tools, and generating the final prompt.
 
 ## Modal model
@@ -116,6 +146,7 @@ Mode labels are explicit in the UI:
 - `Alt+R` — regenerate a materially different alternative with a fresh isolated request
 - `Alt+C` — clear the draft
 - `Alt+Y` — copy the enhanced result
+- `Alt+E` — copy metadata debug artifact to clipboard (excludes prompt body)
 - `Alt+A` — apply the enhanced result back into the main Pi editor
 - `Alt+S` — send the enhanced result as a user message, clear the parent editor, and close the modal
 - `Esc` — close the modal, or abort the in-flight enhancement
@@ -144,11 +175,42 @@ The full modal is a TUI feature.
 - in other UI-capable modes, it uses inline enhancement behavior
 - in no-UI contexts, it fails explicitly and asks you to use Pi TUI or another UI-capable session
 
+## Prompt evals
+
+Eval tests (`test/prompt-evals.test.ts`) run offline — no LLM calls. They
+validate system prompt structure, guardrail presence, and context injection
+against representative fixtures (`test/fixtures/prompt-eval-fixtures.ts`).
+
+Categories: `vague`, `bug-fix`, `follow-up`, `code-review`, `docs`,
+`overly-broad`. Each fixture asserts shared criteria (scope lock, anti-debug,
+anti-essay, output contract, etc.) and optionally category-specific checks.
+Pipeline tests run one fixture per category through the full `enhancePrompt`
+pipeline with a mocked model call.
+
+See [docs/prompt-quality.md](docs/prompt-quality.md) for:
+
+- Guardrail reference and prompt boundaries
+- Good/bad examples for each mode and context type
+- Instructions for adding fixtures or constraints
+- Maintenance rules and verification commands
+
 ## Develop
 
 ```bash
 npm install
 npm run typecheck
 npm test
+npm run build
+# Or run all three in sequence:
+npm run verify
 pi -e .
+```
+
+### Release checklist
+
+Before merging or tagging a release:
+
+```bash
+npm run verify
+# … then commit and push
 ```

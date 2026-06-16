@@ -8,6 +8,7 @@ import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-c
 import { copyToClipboard } from "@earendil-works/pi-coding-agent";
 import { browseCodebase, SAFE_BROWSE_TOOL_NAMES, type BrowseSessionHistoryMessage } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
+import { buildMetadataSummaryParts } from "../src/debug-artifact.js";
 import { PromptGenModal } from "../src/modal.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
 
@@ -183,7 +184,7 @@ function createEnhanceFn(
 
     throwIfAborted(signal);
     onProgress?.("Generating enhanced prompt…");
-    return enhancePrompt({
+    const result = await enhancePrompt({
       input: text,
       mode,
       cwd: ctx.cwd,
@@ -196,6 +197,13 @@ function createEnhanceFn(
       gitContext: browseResult.gitContext,
       sessionContext: browseResult.sessionContext,
     });
+    return {
+      ...result,
+      metadata: {
+        ...result.metadata,
+        browseToolsUsed: browseTools,
+      },
+    };
   };
 }
 
@@ -406,11 +414,15 @@ async function runInlineEnhancement(
   notify("Enhancing prompt…", "info");
 
   let output: string;
+  let metadataSummary = "";
   try {
     const result = await enhanceFn(text, mode, undefined, undefined, (message) => {
       progress.update(message);
     });
     output = result.enhancedPrompt;
+    // Build compact metadata summary for notification.
+    const metaParts = buildMetadataSummaryParts(result.metadata);
+    if (metaParts.length > 0) metadataSummary = ` \u00b7 ${metaParts.join(" \u00b7 ")}`;
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
@@ -425,7 +437,7 @@ async function runInlineEnhancement(
     try {
       await copyToClipboard(output);
       notify(EDITOR_WRITE_WARNING, "warning");
-      notify("Enhanced prompt copied to clipboard.", "info");
+      notify(`Enhanced prompt copied to clipboard.${metadataSummary}`, "info");
     } catch {
       notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
     }
@@ -434,7 +446,7 @@ async function runInlineEnhancement(
 
   try {
     await copyToClipboard(output);
-    notify("Enhanced prompt copied to clipboard and written to editor.", "info");
+    notify(`Enhanced prompt copied to clipboard and written to editor.${metadataSummary}`, "info");
   } catch {
     notify(CLIPBOARD_WRITE_WARNING, "warning");
   } finally {

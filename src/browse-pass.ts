@@ -11,6 +11,7 @@
 import { spawn } from "node:child_process";
 import { realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
+import { TextDecoder } from "node:util";
 import { Type, type Api, type Model } from "@earendil-works/pi-ai";
 import {
   AuthStorage,
@@ -22,7 +23,13 @@ import {
   SessionManager,
   SettingsManager,
 } from "@earendil-works/pi-coding-agent";
-import type { GitContext, Ref, SessionContext, SessionContextMessage } from "./index.js";
+import type { ChangedFileDetail, GitContext, Ref, SessionContext, SessionContextMessage } from "./index.js";
+import {
+  MAX_REASON_CHARS,
+  MAX_ROLE_CHARS,
+  MAX_SYMBOLS,
+  MAX_SYMBOL_CHARS,
+} from "./ref-metadata.js";
 
 const DEFAULT_MAX_REFS = 5;
 const INTERNAL_GIT_TOOL_NAME = "git_context";
@@ -43,8 +50,9 @@ const DEFAULT_GIT_DIFF_BYTES = 12_000;
 const MAX_GIT_DIFF_BYTES = 20_000;
 const GIT_COMMAND_TIMEOUT_MS = 1_500;
 const GIT_COMMAND_MAX_BYTES = 64 * 1024;
+const GIT_PATH_DECODER = new TextDecoder("utf-8", { fatal: false });
 
-export const SAFE_BROWSE_TOOL_NAMES = new Set([
+const SAFE_BROWSE_TOOL_NAME_VALUES = [
   "read",
   "grep",
   "find",
@@ -55,12 +63,20 @@ export const SAFE_BROWSE_TOOL_NAMES = new Set([
   "codegraph_explore",
   "codegraph_node",
   "codegraph_status",
-]);
+] as const;
+
+const RUNTIME_SAFE_BROWSE_TOOL_NAMES = new Set<string>(SAFE_BROWSE_TOOL_NAME_VALUES);
+
+/** Immutable test-facing snapshot of the external browse tool allowlist. */
+export const SAFE_BROWSE_TOOL_NAMES: readonly string[] = Object.freeze([...SAFE_BROWSE_TOOL_NAME_VALUES]);
 
 interface ParsedRef {
   path: string;
   score: number;
   isEntrypoint: boolean;
+  reason?: string;
+  role?: string;
+  symbols?: string[];
 }
 
 export interface BrowseSessionHistoryMessage {
@@ -93,11 +109,22 @@ interface ParsedBrowseResult {
   sessionContext?: SessionContext;
 }
 
+interface ChangedFileDetailPayload {
+  path: string;
+  status: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+  additions?: number;
+  deletions?: number;
+}
+
 interface GitSummaryPayload {
   branch?: string;
   statusSummary?: string;
   changedFiles?: string[];
   diffSummary?: string;
+  changedFileDetails?: ChangedFileDetailPayload[];
 }
 
 interface GitDiffPayload {
@@ -113,6 +140,7 @@ interface GitToolDetails {
   statusSummary?: string;
   changedFiles?: string[];
   diffSummary?: string;
+  changedFileDetails?: ChangedFileDetailPayload[];
   scope?: "working_tree" | "staged";
   diff?: string;
   truncated?: boolean;
@@ -229,9 +257,10 @@ function buildBrowseSystemPrompt(maxRefs: number): string {
     "Your only job is to identify the smallest useful set of files and structured supporting context a later prompt-enhancement model should reference.",
     "",
     "Return ONLY JSON in this shape:",
-    '{"refs":[{"path":"src/file.ts","score":97,"isEntrypoint":false}],"gitContext":{"branch":"feat/name","statusSummary":"2 modified files.","changedFiles":["src/file.ts"],"diffSummary":"Recent local changes adjust browse-pass plumbing."},"sessionContext":{"relevantMessages":[{"role":"user","text":"Follow up on the earlier browse-pass review."}]}}',
+    '{"refs":[{"path":"src/file.ts","score":97,"isEntrypoint":false,"reason":"Entry point for the main module","role":"implementation","symbols":["startApp","config"]}],"gitContext":{"branch":"feat/name","statusSummary":"2 modified files.","changedFiles":["src/file.ts"],"diffSummary":"Recent local changes adjust browse-pass plumbing.","changedFileDetails":[{"path":"src/file.ts","status":"modified","staged":true,"unstaged":false,"untracked":false,"additions":5,"deletions":2}]},"sessionContext":{"relevantMessages":[{"role":"user","text":"Follow up on the earlier browse-pass review."}]}}',
     `Return at most ${maxRefs} refs.`,
     `Return at most ${MAX_CHANGED_FILES} changed files and at most ${MAX_SELECTED_MESSAGES} conversation messages when those sections are useful.`,
+    `Optionally include a short reason (max ${MAX_REASON_CHARS} chars), a role label (max ${MAX_ROLE_CHARS} chars), and key symbols (at most ${MAX_SYMBOLS}, each max ${MAX_SYMBOL_CHARS} chars) for each ref.`,
     "Only include gitContext or sessionContext when they materially help the later prompt rewrite.",
     "Never invent paths, branch names, diffs, or conversation messages. Only return information you actually inspected or directly inferred from inspected tool results.",
   ].join("\n");
@@ -245,6 +274,7 @@ function buildBrowseUserPrompt(input: string, maxRefs: number): string {
     `Browse the codebase and return at most ${maxRefs} file refs that would best ground a later prompt rewrite.`,
     "Use git_context or session_history only when they help preserve continuity for follow-up work.",
     "Prefer entry points, primary implementation files, and the smallest useful support files.",
+    "For each ref, you may optionally include a short reason explaining why it matters, a role label (e.g. implementation, test, config), and key symbols defined in the file.",
   ].join("\n");
 }
 
@@ -310,6 +340,7 @@ function createGitContextTool(cwd: string, observedContext: ObservedBrowseContex
         statusSummary: result.statusSummary,
         changedFiles: result.changedFiles,
         diffSummary: result.diffSummary,
+        changedFileDetails: result.changedFileDetails,
       };
       return {
         content: [{ type: "text", text: JSON.stringify(result, null, 2) }],
@@ -383,16 +414,20 @@ async function getGitSummary(cwd: string, signal?: AbortSignal): Promise<GitSumm
   const status = await runGit(["status", "--porcelain=v1"], cwd, signal);
   const diffStat = await runGit(["diff", "--stat", "--compact-summary"], cwd, signal);
   const stagedDiffStat = await runGit(["diff", "--cached", "--stat", "--compact-summary"], cwd, signal);
+  const numstat = await runGit(["diff", "--numstat"], cwd, signal);
+  const stagedNumstat = await runGit(["diff", "--cached", "--numstat"], cwd, signal);
 
   const statusSummary = summarizeStatus(status.stdout);
   const changedFiles = collectChangedFiles(status.stdout);
   const diffSummary = summarizeDiffStats(diffStat.stdout, stagedDiffStat.stdout);
+  const changedFileDetails = collectChangedFileDetails(status.stdout, numstat.stdout, stagedNumstat.stdout);
 
   return {
     branch,
     statusSummary,
     changedFiles,
     diffSummary,
+    changedFileDetails: changedFileDetails.length > 0 ? changedFileDetails : undefined,
   };
 }
 
@@ -539,13 +574,20 @@ function parseRefsFromJson(parsed: unknown): ParsedRef[] {
       : "";
     if (!path) continue;
 
-    refs.push({
+    const parsedRef: ParsedRef = {
       path,
       score: clampScore((rawRef as { score?: unknown }).score),
       isEntrypoint: typeof (rawRef as { isEntrypoint?: unknown }).isEntrypoint === "boolean"
         ? (rawRef as { isEntrypoint: boolean }).isEntrypoint
         : false,
-    });
+    };
+    const reason = normalizeInlineText((rawRef as { reason?: unknown }).reason, MAX_REASON_CHARS) || undefined;
+    if (reason) parsedRef.reason = reason;
+    const role = normalizeInlineText((rawRef as { role?: unknown }).role, MAX_ROLE_CHARS) || undefined;
+    if (role) parsedRef.role = role;
+    const rawSymbols = normalizeStringArray((rawRef as { symbols?: unknown }).symbols, MAX_SYMBOLS, MAX_SYMBOL_CHARS);
+    if (rawSymbols.length > 0) parsedRef.symbols = rawSymbols;
+    refs.push(parsedRef);
   }
 
   return refs;
@@ -560,8 +602,10 @@ function parseGitContextFromJson(parsed: unknown): GitContext | undefined {
   const statusSummary = normalizeInlineText((raw as { statusSummary?: unknown }).statusSummary, MAX_GIT_SUMMARY_CHARS);
   const changedFiles = normalizeStringArray((raw as { changedFiles?: unknown }).changedFiles, MAX_CHANGED_FILES, 300);
   const diffSummary = normalizeInlineText((raw as { diffSummary?: unknown }).diffSummary, MAX_GIT_DIFF_CHARS);
+  const rawChangedFileDetails = (raw as { changedFileDetails?: unknown }).changedFileDetails;
+  const hasChangedFileDetails = Array.isArray(rawChangedFileDetails);
 
-  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary) return undefined;
+  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary && !hasChangedFileDetails) return undefined;
 
   return {
     branch: branch || undefined,
@@ -614,15 +658,49 @@ function sanitizeObservedGitContext(gitSummary: GitSummaryPayload | undefined): 
   const changedFiles = normalizeStringArray(gitSummary.changedFiles, MAX_CHANGED_FILES, 300)
     .filter(isSafeRepoRelativePathCandidate);
   const diffSummary = normalizeInlineText(gitSummary.diffSummary, MAX_GIT_DIFF_CHARS);
+  const changedFileDetails = sanitizeChangedFileDetails(gitSummary.changedFileDetails);
 
-  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary) return undefined;
+  if (!branch && !statusSummary && changedFiles.length === 0 && !diffSummary && !changedFileDetails) return undefined;
 
   return {
     branch: branch || undefined,
     statusSummary: statusSummary || undefined,
     changedFiles: changedFiles.length > 0 ? changedFiles : undefined,
     diffSummary: diffSummary || undefined,
+    changedFileDetails,
   };
+}
+
+function sanitizeChangedFileDetails(
+  details: ChangedFileDetailPayload[] | undefined,
+): ChangedFileDetail[] | undefined {
+  if (!details || details.length === 0) return undefined;
+
+  const sanitized: ChangedFileDetail[] = [];
+  for (const detail of details) {
+    if (!detail || typeof detail !== "object") continue;
+    const path = normalizeInlineText(detail.path, 400);
+    if (!path || !isSafeRepoRelativePathCandidate(path)) continue;
+    const status = normalizeInlineText(detail.status, 20) || "modified";
+
+    sanitized.push({
+      path,
+      status,
+      staged: detail.staged === true,
+      unstaged: detail.unstaged === true,
+      untracked: detail.untracked === true,
+      additions: normalizeOptionalCount(detail.additions),
+      deletions: normalizeOptionalCount(detail.deletions),
+    });
+
+    if (sanitized.length >= MAX_CHANGED_FILES) break;
+  }
+
+  return sanitized.length > 0 ? sanitized : undefined;
+}
+
+function normalizeOptionalCount(value: unknown): number | undefined {
+  return typeof value === "number" && Number.isInteger(value) && value >= 0 ? value : undefined;
 }
 
 function validateObservedSessionContext(
@@ -654,11 +732,15 @@ async function sanitizeRefs(parsedRefs: ParsedRef[], cwd: string, maxRefs: numbe
     if (!path || seen.has(path)) continue;
 
     seen.add(path);
-    refs.push({
+    const ref: Ref = {
       path,
       score: parsedRef.score,
       isEntrypoint: parsedRef.isEntrypoint,
-    });
+    };
+    if (parsedRef.reason) ref.reason = parsedRef.reason;
+    if (parsedRef.role) ref.role = parsedRef.role;
+    if (parsedRef.symbols?.length) ref.symbols = parsedRef.symbols;
+    refs.push(ref);
   }
 
   return refs;
@@ -751,7 +833,7 @@ function filterSafeBrowseTools(tools: string[]): string[] {
   const safeTools: string[] = [];
 
   for (const tool of tools) {
-    if (!SAFE_BROWSE_TOOL_NAMES.has(tool) || seen.has(tool)) continue;
+    if (!RUNTIME_SAFE_BROWSE_TOOL_NAMES.has(tool) || seen.has(tool)) continue;
     seen.add(tool);
     safeTools.push(tool);
   }
@@ -842,6 +924,132 @@ function normalizeBoundedNumber(value: unknown, fallback: number, max: number): 
   return Math.max(1, Math.min(max, Math.floor(value)));
 }
 
+function collectChangedFileDetails(
+  porcelain: string,
+  numstatOutput: string,
+  stagedNumstatOutput: string,
+): ChangedFileDetailPayload[] {
+  const numstatMap = parseNumstat(numstatOutput);
+  const stagedNumstatMap = parseNumstat(stagedNumstatOutput);
+  const details: ChangedFileDetailPayload[] = [];
+
+  for (const entry of parseStatusEntries(porcelain)) {
+    let additions = 0;
+    let deletions = 0;
+    const unstagedStat = numstatMap.get(entry.path);
+    const stagedStat = stagedNumstatMap.get(entry.path);
+    if (unstagedStat) {
+      additions += unstagedStat.additions;
+      deletions += unstagedStat.deletions;
+    }
+    if (stagedStat) {
+      additions += stagedStat.additions;
+      deletions += stagedStat.deletions;
+    }
+
+    const detail: ChangedFileDetailPayload = {
+      path: entry.path,
+      status: entry.status,
+      staged: entry.staged,
+      unstaged: entry.unstaged,
+      untracked: entry.untracked,
+    };
+    if (additions > 0 || deletions > 0) {
+      detail.additions = additions;
+      detail.deletions = deletions;
+    }
+
+    details.push(detail);
+    if (details.length >= MAX_CHANGED_FILES) break;
+  }
+
+  return details;
+}
+
+function parseNumstat(output: string): Map<string, { additions: number; deletions: number }> {
+  const map = new Map<string, { additions: number; deletions: number }>();
+  for (const rawLine of output.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    const parts = line.split("\t");
+    if (parts.length < 3) continue;
+    const additions = parseInt(parts[0], 10);
+    const deletions = parseInt(parts[1], 10);
+    if (!Number.isFinite(additions) || !Number.isFinite(deletions)) continue;
+    // For renames/copies, numstat emits old_path\tnew_path (4+ parts)
+    const path = parts.length >= 4 ? parts[parts.length - 1] : parts[2];
+    if (!path) continue;
+    // Resolve Git's compact rename format: src/{old.ts => new.ts} → src/new.ts
+    const resolvedPath = parseCompactRenamePath(path) ?? path;
+    const existing = map.get(resolvedPath);
+    if (existing) {
+      existing.additions += additions;
+      existing.deletions += deletions;
+    } else {
+      map.set(resolvedPath, { additions, deletions });
+    }
+  }
+  return map;
+}
+
+/**
+ * Extract the new path from Git's compact rename format.
+ *
+ * Git sometimes outputs renames in compact curly-brace form:
+ *   src/{old.ts => new.ts}  →  src/new.ts
+ *   {old.ts => new.ts}      →  new.ts
+ *
+ * Returns the resolved new path, or null if the format is not present.
+ */
+function parseCompactRenamePath(path: string): string | null {
+  const braceOpen = path.indexOf("{");
+  if (braceOpen === -1) return null;
+  const braceClose = path.indexOf("}", braceOpen + 1);
+  if (braceClose === -1) return null;
+
+  const prefix = path.slice(0, braceOpen);
+  const inside = path.slice(braceOpen + 1, braceClose);
+  const suffix = path.slice(braceClose + 1);
+
+  const arrowIndex = inside.indexOf("=>");
+  if (arrowIndex === -1) return null;
+
+  const newPart = inside.slice(arrowIndex + 2).trim();
+  if (!newPart) return null;
+
+  return prefix + newPart + suffix;
+}
+
+function xyToStatus(
+  x: string,
+  y: string,
+): { status: string; staged: boolean; unstaged: boolean; untracked: boolean } {
+  if (x === "?" && y === "?") {
+    return { status: "unknown", staged: false, unstaged: false, untracked: true };
+  }
+
+  let status: string;
+  if (x === "M") status = "modified";
+  else if (x === "A") status = "added";
+  else if (x === "D") status = "deleted";
+  else if (x === "R") status = "renamed";
+  else if (x === "C") status = "copied";
+  else if (x === "U" || y === "U") status = "unmerged";
+  else if (x === "T" || y === "T") status = "modified";
+  else if (y === "M") status = "modified";
+  else if (y === "D") status = "deleted";
+  else if (y === "A") status = "added";
+  else if (x === " " && y === " ") status = "modified";
+  else status = "modified";
+
+  return {
+    status,
+    staged: x !== " " && x !== "?",
+    unstaged: y !== " " && y !== "?",
+    untracked: false,
+  };
+}
+
 function summarizeStatus(porcelain: string): string {
   const { staged, unstaged, untracked } = categorizeStatusLines(porcelain);
   const parts: string[] = [];
@@ -866,10 +1074,19 @@ function summarizeDiffStats(workingTreeStat: string, stagedStat: string): string
   return summary ? summary.slice(0, MAX_GIT_DIFF_CHARS) : undefined;
 }
 
-function categorizeStatusLines(porcelain: string): { staged: string[]; unstaged: string[]; untracked: string[] } {
-  const staged: string[] = [];
-  const unstaged: string[] = [];
-  const untracked: string[] = [];
+interface StatusEntry {
+  path: string;
+  x: string;
+  y: string;
+  status: string;
+  staged: boolean;
+  unstaged: boolean;
+  untracked: boolean;
+}
+
+function parseStatusEntries(porcelain: string): StatusEntry[] {
+  const entries: StatusEntry[] = [];
+  const seen = new Set<string>();
 
   for (const rawLine of porcelain.split(/\r?\n/)) {
     const line = rawLine.trimEnd();
@@ -877,14 +1094,27 @@ function categorizeStatusLines(porcelain: string): { staged: string[]; unstaged:
     const x = line[0] ?? " ";
     const y = line[1] ?? " ";
     const path = extractStatusPath(line.slice(3));
-    if (!path) continue;
+    if (!path || seen.has(path)) continue;
+    seen.add(path);
 
-    if (x === "?" && y === "?") {
-      untracked.push(path);
+    entries.push({ path, x, y, ...xyToStatus(x, y) });
+  }
+
+  return entries;
+}
+
+function categorizeStatusLines(porcelain: string): { staged: string[]; unstaged: string[]; untracked: string[] } {
+  const staged: string[] = [];
+  const unstaged: string[] = [];
+  const untracked: string[] = [];
+
+  for (const entry of parseStatusEntries(porcelain)) {
+    if (entry.untracked) {
+      untracked.push(entry.path);
       continue;
     }
-    if (x !== " ") staged.push(path);
-    if (y !== " ") unstaged.push(path);
+    if (entry.staged) staged.push(entry.path);
+    if (entry.unstaged) unstaged.push(entry.path);
   }
 
   return {
@@ -898,7 +1128,61 @@ function extractStatusPath(rawPath: string): string {
   const trimmed = rawPath.trim();
   if (!trimmed) return "";
   const renamedPath = trimmed.includes(" -> ") ? trimmed.split(" -> ").at(-1) ?? trimmed : trimmed;
-  return normalizeInlineText(renamedPath, 400);
+  return normalizeInlineText(unquoteGitStatusPath(renamedPath), 400);
+}
+
+function unquoteGitStatusPath(path: string): string {
+  if (!path.startsWith('"') || !path.endsWith('"')) return path;
+
+  const inner = path.slice(1, -1);
+  let result = "";
+  let octalBytes: number[] = [];
+  const flushOctalBytes = () => {
+    if (octalBytes.length === 0) return;
+    result += GIT_PATH_DECODER.decode(Uint8Array.from(octalBytes));
+    octalBytes = [];
+  };
+
+  for (let i = 0; i < inner.length; i++) {
+    const char = inner[i]!;
+    if (char !== "\\") {
+      flushOctalBytes();
+      result += char;
+      continue;
+    }
+
+    const next = inner[++i];
+    if (next === undefined) break;
+    if (next === "n") {
+      flushOctalBytes();
+      result += "\n";
+    } else if (next === "r") {
+      flushOctalBytes();
+      result += "\r";
+    } else if (next === "t") {
+      flushOctalBytes();
+      result += "\t";
+    } else if (next === "b") {
+      flushOctalBytes();
+      result += "\b";
+    } else if (next === "f") {
+      flushOctalBytes();
+      result += "\f";
+    } else if (next >= "0" && next <= "7") {
+      let octal = next;
+      for (let j = 0; j < 2; j++) {
+        const peek = inner[i + 1];
+        if (peek === undefined || peek < "0" || peek > "7") break;
+        octal += inner[++i]!;
+      }
+      octalBytes.push(parseInt(octal, 8));
+    } else {
+      flushOctalBytes();
+      result += next;
+    }
+  }
+  flushOctalBytes();
+  return result;
 }
 
 function uniqueStrings(values: string[]): string[] {

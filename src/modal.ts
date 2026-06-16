@@ -18,6 +18,7 @@
  *   Alt+m        toggle rewrite / generate mode
  *   Alt+c        clear draft
  *   Alt+y        yank (copy) enhanced result to clipboard
+ *   Alt+e        export / copy metadata artifact (excludes prompt body)
  *   Alt+a        apply enhanced result to Pi editor
  *   Alt+s        send enhanced result as user message
  *   Escape       close modal (or abort running enhancement)
@@ -37,6 +38,7 @@ import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } 
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { EnhancePromptResult } from "./index.js";
 import type { EnhancerMode } from "./enhancer-prompt.js";
+import { buildDebugArtifact, buildMetadataSummaryParts } from "./debug-artifact.js";
 
 // ---------------------------------------------------------------------------
 // Wrapping
@@ -407,6 +409,11 @@ export class PromptGenModal implements TuiComponent {
         parts.push(`\u25cf ${refCount} ref${refCount > 1 ? "s" : ""}`);
       }
       parts.push(`${lineCount} line${lineCount > 1 ? "s" : ""}`);
+      // Append run metadata when available
+      const metaParts = buildMetadataSummaryParts(this.result.metadata);
+      for (const mp of metaParts) {
+        parts.push(mp);
+      }
       const meta = dim(parts.join(" \u00b7 "), this.theme);
       lines.push(meta + " ".repeat(Math.max(0, inner - visibleWidth(meta))));
     } else {
@@ -421,7 +428,7 @@ export class PromptGenModal implements TuiComponent {
         this.theme,
       ));
       lines.push(dim(
-        `[Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
+        `[Alt+E] Meta  [Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
         this.theme,
       ));
     } else {
@@ -430,7 +437,7 @@ export class PromptGenModal implements TuiComponent {
         this.theme,
       ));
       lines.push(dim(
-        `[Alt+R] Regenerate  [Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send`,
+        `[Alt+R] Regenerate  [Alt+Y] Copy  [Alt+E] Meta  [Alt+A] Apply  [Alt+S] Send`,
         this.theme,
       ));
     }
@@ -489,6 +496,10 @@ export class PromptGenModal implements TuiComponent {
     }
     if (this.matchesAction(data, "alt+y", Key.alt("y"))) {
       void this.copyResult();
+      return;
+    }
+    if (this.matchesAction(data, "alt+e", Key.alt("e"))) {
+      void this.copyDebugArtifact();
       return;
     }
     if (this.matchesAction(data, "alt+a", Key.alt("a"))) {
@@ -852,6 +863,21 @@ export class PromptGenModal implements TuiComponent {
       this.notifyFn("Copied to clipboard.", "info");
     } catch {
       this.notifyFn("Failed to copy to clipboard.", "error");
+    }
+  }
+
+  private async copyDebugArtifact(): Promise<void> {
+    const r = this.result;
+    if (!r) {
+      this.notifyFn("No enhanced result to export. Enhance draft first.", "warning");
+      return;
+    }
+    try {
+      const artifact = buildDebugArtifact(r);
+      await this.copyFn(artifact);
+      this.notifyFn("Metadata artifact copied to clipboard.", "info");
+    } catch {
+      this.notifyFn("Failed to copy debug artifact.", "error");
     }
   }
 
