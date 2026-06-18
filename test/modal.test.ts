@@ -13,6 +13,7 @@
 
 import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { visibleWidth } from "@earendil-works/pi-tui";
 import { PromptGenModal, type PromptGenModalOptions, type PromptGenModalResult } from "../src/modal.js";
 import type { EnhancePromptResult } from "../src/index.js";
@@ -51,6 +52,23 @@ function makeTheme(): Theme {
     italic: (text: string) => text,
     underline: (text: string) => text,
   } as unknown as Theme;
+}
+
+function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
+  return {
+    id: "gpt-5.5",
+    name: "gpt-5.5",
+    api: "openai-responses" as Api,
+    provider: "test-provider",
+    baseUrl: "https://api.example.com/v1",
+    reasoning: true,
+    thinkingLevelMap: { xhigh: "xhigh" },
+    input: ["text"],
+    cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+    contextWindow: 128000,
+    maxTokens: 8192,
+    ...overrides,
+  };
 }
 
 function makeEnhanceResult(overrides?: Partial<EnhancePromptResult>): EnhancePromptResult {
@@ -189,6 +207,137 @@ describe("PromptGenModal mode toggle", () => {
     // Toggle back to rewrite
     press(modal, "\u001bm"); // Alt+m
     expect(modal.render(80).join("\n")).toContain("rewrite");
+  });
+});
+
+describe("PromptGenModal model and thinking shortcuts", () => {
+  it("cycles available models with Ctrl+P and reports the selection", () => {
+    const first = makeModel({ id: "gpt-5.5", name: "gpt-5.5" });
+    const second = makeModel({ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic" });
+    const onSelectionChange = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      availableModels: [first, second],
+      selectedModel: first,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+      onSelectionChange,
+    }));
+    bindModal(modal);
+
+    press(modal, "\x10"); // Ctrl+P
+
+    expect(onSelectionChange).toHaveBeenCalledWith({ model: second, thinkingLevel: "high" });
+    expect(modal.render(100).join("\n")).toContain("claude-sonnet:high");
+  });
+
+  it("cycles thinking levels with Shift+T and reports the selection", () => {
+    const model = makeModel({ id: "gpt-5.5", name: "gpt-5.5" });
+    const onSelectionChange = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      availableModels: [model],
+      selectedModel: model,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+      onSelectionChange,
+    }));
+    bindModal(modal);
+
+    press(modal, "\u001b[84;2u"); // Shift+T with modifier-aware terminal encoding
+
+    expect(onSelectionChange).toHaveBeenCalledWith({ model, thinkingLevel: "xhigh" });
+    expect(modal.render(100).join("\n")).toContain("gpt-5.5:xhigh");
+  });
+
+  it("normalizes an unsupported initial thinking level for the selected model", () => {
+    const model = makeModel({
+      id: "basic-model",
+      name: "Basic Model",
+      reasoning: true,
+      thinkingLevelMap: { high: null, xhigh: "xhigh" },
+    });
+    const modal = new PromptGenModal(makeModalOptions({
+      availableModels: [model],
+      selectedModel: model,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+    }));
+    bindModal(modal);
+
+    expect(modal.render(100).join("\n")).toContain("basic-model:xhigh");
+  });
+
+  it("inserts plain uppercase T instead of treating it as Shift+T", () => {
+    const model = makeModel({ id: "gpt-5.5", name: "gpt-5.5" });
+    const onSelectionChange = vi.fn();
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "",
+      availableModels: [model],
+      selectedModel: model,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+      onSelectionChange,
+    }));
+    bindModal(modal);
+
+    press(modal, "T");
+
+    expect(onSelectionChange).not.toHaveBeenCalled();
+    expect(modal.render(100).join("\n")).toContain("T");
+  });
+
+  it("passes selected model and thinking to enhancement", async () => {
+    const model = makeModel({ id: "gpt-5.5", name: "gpt-5.5" });
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+      availableModels: [model],
+      selectedModel: model,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+
+    await vi.waitFor(() => {
+      expect(enhanceFn).toHaveBeenCalledWith(
+        "test",
+        "rewrite",
+        expect.any(AbortSignal),
+        undefined,
+        expect.any(Function),
+        { model, thinkingLevel: "high" },
+      );
+    });
+  });
+
+  it("clears an existing result when model changes so actions cannot use stale output", async () => {
+    const first = makeModel({ id: "gpt-5.5", name: "gpt-5.5" });
+    const second = makeModel({ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic" });
+    const notifyFn = vi.fn();
+    const copyFn = vi.fn().mockResolvedValue(undefined);
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult({ enhancedPrompt: "stale enhanced output" }));
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "test",
+      enhanceFn,
+      copyFn,
+      notifyFn,
+      availableModels: [first, second],
+      selectedModel: first,
+      selectedThinkingLevel: "high" as ModelThinkingLevel,
+    }));
+    bindModal(modal);
+
+    press(modal, "\r");
+    await vi.waitFor(() => {
+      expect(modal.render(100).join("\n")).toContain("stale enhanced output");
+    });
+
+    press(modal, "\x10"); // Ctrl+P
+    expect(modal.render(100).join("\n")).not.toContain("stale enhanced output");
+
+    press(modal, "\u001by"); // Alt+y
+    expect(copyFn).not.toHaveBeenCalled();
+    expect(notifyFn).toHaveBeenCalledWith(
+      "No enhanced result to copy. Enhance draft first.",
+      "warning",
+    );
   });
 });
 

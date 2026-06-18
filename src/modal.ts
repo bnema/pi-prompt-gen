@@ -36,89 +36,12 @@
 import type { Component as TuiComponent } from "@earendil-works/pi-tui";
 import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { EnhancePromptResult } from "./index.js";
 import type { EnhancerMode } from "./enhancer-prompt.js";
 import { buildDebugArtifact, buildMetadataSummaryParts } from "./debug-artifact.js";
-
-// ---------------------------------------------------------------------------
-// Wrapping
-// ---------------------------------------------------------------------------
-
-/** A soft-wrapped segment of the draft text. */
-interface WrappedLine {
-  /** The segment text (at most `width` cells wide). */
-  text: string;
-  /** Which hard (newline-separated) line this segment belongs to. */
-  hardLine: number;
-  /** Absolute start offset of this segment in the draft string. */
-  start: number;
-  /** Absolute end offset (exclusive) of this segment in the draft string. */
-  end: number;
-  /** Whether this segment exactly filled the wrap width. */
-  fullWidth: boolean;
-}
-
-/**
- * Soft-wrap each hard line of `text` to fit `width` visible cells.
- * Empty hard lines produce a single empty segment so visual line count
- * stays in sync with the newline-delimited source.
- */
-function wrapToWidth(text: string, width: number): WrappedLine[] {
-  if (width <= 0) width = 1;
-  const hardLines = text.split("\n");
-  const result: WrappedLine[] = [];
-  let hardOffset = 0;
-
-  for (let hl = 0; hl < hardLines.length; hl++) {
-    const line = hardLines[hl]!;
-    if (line.length === 0) {
-      result.push({ text: "", hardLine: hl, start: hardOffset, end: hardOffset, fullWidth: false });
-    } else {
-      let segment = "";
-      let segmentWidth = 0;
-      let segmentStart = 0;
-      let i = 0;
-
-      while (i < line.length) {
-        const codePoint = line.codePointAt(i)!;
-        const ch = String.fromCodePoint(codePoint);
-        const step = ch.length;
-        const chWidth = visibleWidth(ch);
-
-        if (segment !== "" && segmentWidth + chWidth > width) {
-          result.push({
-            text: segment,
-            hardLine: hl,
-            start: hardOffset + segmentStart,
-            end: hardOffset + i,
-            fullWidth: segmentWidth >= width,
-          });
-          segment = "";
-          segmentWidth = 0;
-          segmentStart = i;
-          continue;
-        }
-
-        segment += ch;
-        segmentWidth += chWidth;
-        i += step;
-      }
-
-      result.push({
-        text: segment,
-        hardLine: hl,
-        start: hardOffset + segmentStart,
-        end: hardOffset + line.length,
-        fullWidth: segmentWidth >= width,
-      });
-    }
-
-    hardOffset += line.length;
-    if (hl < hardLines.length - 1) hardOffset += 1;
-  }
-
-  return result;
-}
+import { PromptModelSelectionController } from "./model-selection.js";
+import { wrapToWidth, type WrappedLine } from "./text-wrap.js";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -133,8 +56,23 @@ export interface PromptGenModalOptions {
   initialTextLabel?: string;
   /** Initial mode. Auto-detected from initialText when not provided. */
   mode?: EnhancerMode;
+  /** Available models that can be selected inside the modal. */
+  availableModels?: Model<Api>[];
+  /** Currently selected model for modal-triggered enhancement. */
+  selectedModel?: Model<Api>;
+  /** Currently selected thinking level. Undefined means the caller default. */
+  selectedThinkingLevel?: ModelThinkingLevel;
+  /** Called after the modal cycles model or thinking selection. */
+  onSelectionChange?: (selection: { model: Model<Api>; thinkingLevel: ModelThinkingLevel }) => void;
   /** Callback that performs the actual enhancement. */
-  enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => Promise<EnhancePromptResult>;
+  enhanceFn: (
+    text: string,
+    mode: EnhancerMode,
+    signal?: AbortSignal,
+    previousOutput?: string,
+    onProgress?: (message: string) => void,
+    selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+  ) => Promise<EnhancePromptResult>;
   /** Copy text to clipboard. */
   copyFn: (text: string) => Promise<void>;
   /** Write text to the main Pi editor. */
@@ -235,6 +173,7 @@ const MAX_DRAFT_HEIGHT = 8;
 const MAX_PREVIEW_HEIGHT = 10;
 const ENHANCING_SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const ENHANCING_SPINNER_INTERVAL_MS = 120;
+
 // ---------------------------------------------------------------------------
 // Component
 // ---------------------------------------------------------------------------
@@ -262,7 +201,15 @@ export class PromptGenModal implements TuiComponent {
   private done!: (result: PromptGenModalResult | undefined) => void;
   private requestRender!: () => void;
   private keybindings: { matches(data: string, keybinding: string): boolean } | undefined;
-  private enhanceFn: (text: string, mode: EnhancerMode, signal?: AbortSignal, previousOutput?: string, onProgress?: (message: string) => void) => Promise<EnhancePromptResult>;
+  private selectionController: PromptModelSelectionController;
+  private enhanceFn: (
+    text: string,
+    mode: EnhancerMode,
+    signal?: AbortSignal,
+    previousOutput?: string,
+    onProgress?: (message: string) => void,
+    selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+  ) => Promise<EnhancePromptResult>;
   private copyFn: (text: string) => Promise<void>;
   private applyFn: (text: string) => void;
   private sendFn: (text: string) => Promise<void> | void;
@@ -273,6 +220,12 @@ export class PromptGenModal implements TuiComponent {
   constructor(options: PromptGenModalOptions) {
     this.draft = options.initialText ?? "";
     this.mode = options.mode ?? (this.draft.trim() ? "rewrite" : "generate");
+    this.selectionController = new PromptModelSelectionController({
+      availableModels: options.availableModels,
+      selectedModel: options.selectedModel,
+      selectedThinkingLevel: options.selectedThinkingLevel,
+      onSelectionChange: options.onSelectionChange,
+    });
     this.enhanceFn = options.enhanceFn;
     this.copyFn = options.copyFn;
     this.applyFn = options.applyFn;
@@ -431,15 +384,17 @@ export class PromptGenModal implements TuiComponent {
         `[Alt+E] Meta  [Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
         this.theme,
       ));
+      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking`, inner));
     } else {
       lines.push(dim(
-        `[Enter] Enhance  [Alt+M] Mode  [Alt+C] Clear  [Esc] Close`,
+        `[Enter] Enhance  [Alt+R] Regenerate  [Alt+M] Mode  [Alt+C] Clear`,
         this.theme,
       ));
       lines.push(dim(
-        `[Alt+R] Regenerate  [Alt+Y] Copy  [Alt+E] Meta  [Alt+A] Apply  [Alt+S] Send`,
+        `[Alt+Y] Copy  [Alt+E] Meta  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
         this.theme,
       ));
+      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking`, inner));
     }
 
     return frameContent(lines, width, "/prompt", this.theme);
@@ -486,6 +441,16 @@ export class PromptGenModal implements TuiComponent {
     }
     if (this.matchesAction(data, "alt+m", Key.alt("m"))) {
       this.toggleMode();
+      this.requestRender();
+      return;
+    }
+    if (this.matchesAction(data, "app.model.cycleForward", Key.ctrl("p"))) {
+      this.cycleModel();
+      this.requestRender();
+      return;
+    }
+    if (this.matchesShiftT(data)) {
+      this.cycleThinkingLevel();
       this.requestRender();
       return;
     }
@@ -810,6 +775,27 @@ export class PromptGenModal implements TuiComponent {
     }
   }
 
+  private cycleModel(): void {
+    if (!this.selectionController.cycleModel()) return;
+    this.result = undefined;
+    this.resetProgress();
+    this.setStatus("idle", `model ${this.selectionController.statusModelLabel() ?? "model"}`);
+  }
+
+  private cycleThinkingLevel(): void {
+    if (!this.selectionController.cycleThinkingLevel()) return;
+    this.result = undefined;
+    this.resetProgress();
+    this.setStatus("idle", `thinking ${this.selectionController.selection()?.thinkingLevel ?? "off"}`);
+  }
+
+  private renderFooterStatus(helpText: string, inner: number): string {
+    const help = dim(helpText, this.theme);
+    const selection = dim(this.selectionController.label(), this.theme);
+    const gap = Math.max(1, inner - visibleWidth(help) - visibleWidth(selection));
+    return help + " ".repeat(gap) + selection;
+  }
+
   private async runEnhancement(regenerate = false): Promise<void> {
     const text = this.draft.trim();
     if (!text) {
@@ -827,17 +813,15 @@ export class PromptGenModal implements TuiComponent {
     this.requestRender();
 
     try {
-      const result = await this.enhanceFn(
-        text,
-        this.mode,
-        controller.signal,
-        previousOutput,
-        (message: string) => {
-          if (!message || requestId !== this.requestVersion || controller.signal.aborted) return;
-          this.pushProgress(message);
-          this.requestRender();
-        },
-      );
+      const onProgress = (message: string) => {
+        if (!message || requestId !== this.requestVersion || controller.signal.aborted) return;
+        this.pushProgress(message);
+        this.requestRender();
+      };
+      const selection = this.selectionController.selection();
+      const result = selection
+        ? await this.enhanceFn(text, this.mode, controller.signal, previousOutput, onProgress, selection)
+        : await this.enhanceFn(text, this.mode, controller.signal, previousOutput, onProgress);
       if (controller.signal.aborted || requestId !== this.requestVersion) return;
       this.result = result;
       this.setStatus("enhanced", "");
@@ -976,5 +960,11 @@ export class PromptGenModal implements TuiComponent {
 
   private matchesAction(data: string, binding: string, fallback: string): boolean {
     return Boolean(this.keybindings?.matches(data, binding)) || matchesKey(data, fallback as never);
+  }
+
+  private matchesShiftT(data: string): boolean {
+    if (this.keybindings?.matches(data, "app.thinking.cycle")) return true;
+    if (data === "T") return false;
+    return matchesKey(data, Key.shift("t"));
   }
 }

@@ -6,7 +6,9 @@
  * conversation ids, and no dependency on sessionManager.
  */
 
-import { complete, type Api, type Message, type Model, type StopReason, type Usage } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, complete, completeSimple, type Api, type Message, type Model, type ModelThinkingLevel, type StopReason, type Usage } from "@earendil-works/pi-ai";
+
+const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 /**
  * Parameters for an isolated model call.
@@ -24,6 +26,8 @@ export interface ModelCallParams {
 	headers?: Record<string, string>;
 	/** Optional abort signal to cancel the request. */
 	signal?: AbortSignal;
+	/** Optional thinking level for providers that support reasoning. */
+	thinkingLevel?: ModelThinkingLevel;
 	/** System prompt guiding the model's behavior for this call. */
 	systemPrompt?: string;
 	/** The user-visible content to send (e.g. the prompt to rewrite). */
@@ -63,7 +67,12 @@ export interface ModelCallResult {
  * distinguish completed-but-failed responses from transport-level failures.
  */
 export async function makeModelCall(params: ModelCallParams): Promise<ModelCallResult> {
-	const { model, apiKey, headers, signal, systemPrompt, userContent } = params;
+	const { model, apiKey, headers, signal, thinkingLevel, systemPrompt, userContent } = params;
+
+	if (thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(thinkingLevel)) {
+		throw new Error(`Invalid thinking level: ${String(thinkingLevel)}`);
+	}
+	const effectiveThinkingLevel = thinkingLevel !== undefined ? clampThinkingLevel(model, thinkingLevel) : undefined;
 
 	const messages: Message[] = [
 		{
@@ -73,11 +82,17 @@ export async function makeModelCall(params: ModelCallParams): Promise<ModelCallR
 		},
 	];
 
-	const response = await complete(
-		model,
-		{ systemPrompt, messages },
-		{ apiKey, headers, signal },
-	);
+	const response = effectiveThinkingLevel && effectiveThinkingLevel !== "off"
+		? await completeSimple(
+			model,
+			{ systemPrompt, messages },
+			{ apiKey, headers, signal, reasoning: effectiveThinkingLevel },
+		)
+		: await complete(
+			model,
+			{ systemPrompt, messages },
+			{ apiKey, headers, signal },
+		);
 
 	const textContent = response.content
 		.filter((c): c is { type: "text"; text: string } => c.type === "text")

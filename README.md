@@ -143,6 +143,8 @@ Mode labels are explicit in the UI:
 - `Enter` — enhance the current draft, then re-enhance after a result exists
 - `Shift+Enter` — insert newline
 - `Alt+M` — toggle rewrite/generate mode
+- `Ctrl+P` — cycle the prompt generator model
+- `Shift+T` — cycle the prompt generator thinking level
 - `Alt+R` — regenerate a materially different alternative with a fresh isolated request
 - `Alt+C` — clear the draft
 - `Alt+Y` — copy the enhanced result
@@ -152,6 +154,8 @@ Mode labels are explicit in the UI:
 - `Esc` — close the modal, or abort the in-flight enhancement
 
 `copy`, `apply`, and `send` operate on the **enhanced result** only. If no result exists yet, the modal asks you to enhance first instead of silently using the raw draft.
+
+The modal footer shows the selected model and thinking level at the bottom right, for example `gpt-5.5:high`. Model/thinking choices persist globally for later pi-prompt-gen modal openings across sessions and projects.
 
 If the preview is truncated, the modal tells you that the hidden lines still count: copy/apply/send use the full result.
 
