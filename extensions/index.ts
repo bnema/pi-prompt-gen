@@ -4,8 +4,11 @@
  * Registers the /prompt command for modal or inline prompt enhancement.
  */
 
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { copyToClipboard } from "@earendil-works/pi-coding-agent";
+import { copyToClipboard, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import { clampThinkingLevel, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { browseCodebase, SAFE_BROWSE_TOOL_NAMES, type BrowseSessionHistoryMessage } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
 import { buildMetadataSummaryParts } from "../src/debug-artifact.js";
@@ -14,8 +17,19 @@ import type { EnhancerMode } from "../src/enhancer-prompt.js";
 
 interface ResolvedEnhanceConfig {
   model: NonNullable<ExtensionCommandContext["model"]>;
-  apiKey: string;
+  apiKey?: string;
   headers?: Record<string, string>;
+}
+
+interface PromptGenPersistedSettings {
+  modelProvider?: string;
+  modelId?: string;
+  thinkingLevel?: ModelThinkingLevel;
+}
+
+interface PromptGenSelection {
+  model: Model<Api>;
+  thinkingLevel: ModelThinkingLevel;
 }
 
 type EnhanceFn = (
@@ -24,6 +38,7 @@ type EnhanceFn = (
   signal?: AbortSignal,
   previousOutput?: string,
   onProgress?: (message: string) => void,
+  selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
 ) => ReturnType<typeof enhancePrompt>;
 
 const INLINE_STATUS_KEY = "pi-prompt-gen";
@@ -35,6 +50,8 @@ const CLIPBOARD_WRITE_WARNING = "Enhanced prompt written to editor, but failed t
 const NO_UI_ERROR_MESSAGE =
   "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
   "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
+const GLOBAL_SETTINGS_FILE = "prompt-gen-settings.json";
+const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -45,48 +62,33 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     const initialTextLabel = resolvePrefillLabel(args, ctx);
     const notify = (msg: string, type?: "info" | "warning" | "error") => ctx.ui.notify(msg, type);
 
-    const enhanceConfig = await resolveEnhanceConfig(ctx);
-    if (!enhanceConfig) return;
-
-    const enhanceFn = createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi));
+    const browseTools = resolveBrowseToolNames(pi);
 
     if (args.trim()) {
-      await runInlineEnhancement(ctx, initialText, initialMode, enhanceFn, notify);
+      const enhanceConfig = await resolveEnhanceConfig(ctx);
+      if (!enhanceConfig) return;
+      await runInlineEnhancement(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify);
       return;
     }
 
     if (ctx.mode !== "tui") {
-      await runNonTuiFallback(ctx, initialText, initialMode, enhanceFn, notify);
+      const enhanceConfig = await resolveEnhanceConfig(ctx);
+      if (!enhanceConfig) return;
+      await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify);
       return;
     }
 
-    const modal = new PromptGenModal({
+    const enhanceConfig = resolveEnhanceModelConfig(ctx);
+    if (!enhanceConfig) return;
+
+    await openPromptGenModal(pi, ctx, {
       initialText,
       initialTextLabel,
-      mode: initialMode,
-      enhanceFn,
-      copyFn: copyToClipboard,
-      applyFn: (text: string) => {
-        ctx.ui.setEditorText(text);
-      },
-      sendFn: createSendFn(pi, ctx),
-      notifyFn: notify,
+      initialMode,
+      enhanceConfig,
+      browseTools,
+      notify,
     });
-
-    await ctx.ui.custom<{ draftText: string } | undefined>(
-      (tui, theme, keybindings, done) => {
-        modal.bind(theme, done, () => tui.requestRender(), keybindings);
-        return modal;
-      },
-      {
-        overlay: true,
-        overlayOptions: {
-          width: "90%",
-          maxHeight: "80%",
-          anchor: "center",
-        },
-      },
-    );
   };
 
   pi.registerCommand("prompt", {
@@ -119,45 +121,81 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
         return;
       }
 
-      const enhanceConfig = await resolveEnhanceConfig(ctx as ExtensionCommandContext);
+      const enhanceConfig = resolveEnhanceModelConfig(ctx as ExtensionCommandContext);
       if (!enhanceConfig) return;
 
-      const enhanceFn = createEnhanceFn(ctx as ExtensionCommandContext, enhanceConfig, resolveBrowseToolNames(pi));
-      const modal = new PromptGenModal({
+      await openPromptGenModal(pi, ctx as ExtensionCommandContext, {
         initialText,
         initialTextLabel,
-        mode: initialMode,
-        enhanceFn,
-        copyFn: copyToClipboard,
-        applyFn: (text: string) => {
-          ctx.ui.setEditorText(text);
-        },
-        sendFn: createSendFn(pi, ctx),
-        notifyFn: (msg, type) => ctx.ui.notify(msg, type),
+        initialMode,
+        enhanceConfig,
+        browseTools: resolveBrowseToolNames(pi),
+        notify: (msg: string, type?: "info" | "warning" | "error") => ctx.ui.notify(msg, type),
       });
-
-      await ctx.ui.custom<{ draftText: string } | undefined>(
-        (tui, theme, keybindings, done) => {
-          modal.bind(theme, done, () => tui.requestRender(), keybindings);
-          return modal;
-        },
-        {
-          overlay: true,
-          overlayOptions: {
-            width: "90%",
-            maxHeight: "80%",
-            anchor: "center",
-          },
-        },
-      );
     },
   });
+}
+
+interface OpenPromptGenModalOptions {
+  initialText: string;
+  initialTextLabel: string;
+  initialMode: EnhancerMode;
+  enhanceConfig: ResolvedEnhanceConfig;
+  browseTools: string[];
+  notify: (msg: string, type?: "info" | "warning" | "error") => void;
+}
+
+async function openPromptGenModal(
+  pi: ExtensionAPI,
+  ctx: ExtensionCommandContext,
+  options: OpenPromptGenModalOptions,
+): Promise<void> {
+  const availableModels = resolveAvailableModels(ctx, options.enhanceConfig.model);
+  let currentSelection = resolveInitialSelection(ctx, availableModels, options.enhanceConfig.model);
+  const persistSelection = () => persistPromptGenSelection(currentSelection);
+  const enhanceFn = createEnhanceFn(ctx, options.enhanceConfig, options.browseTools, () => currentSelection);
+
+  const modal = new PromptGenModal({
+    initialText: options.initialText,
+    initialTextLabel: options.initialTextLabel,
+    mode: options.initialMode,
+    enhanceFn,
+    availableModels,
+    selectedModel: currentSelection.model,
+    selectedThinkingLevel: currentSelection.thinkingLevel,
+    onSelectionChange: (selection) => {
+      currentSelection = selection;
+      persistSelection();
+    },
+    copyFn: copyToClipboard,
+    applyFn: (text: string) => {
+      ctx.ui.setEditorText(text);
+    },
+    sendFn: createSendFn(pi, ctx),
+    notifyFn: options.notify,
+  });
+
+  await ctx.ui.custom<{ draftText: string } | undefined>(
+    (tui, theme, keybindings, done) => {
+      modal.bind(theme, done, () => tui.requestRender(), keybindings);
+      return modal;
+    },
+    {
+      overlay: true,
+      overlayOptions: {
+        width: "90%",
+        maxHeight: "80%",
+        anchor: "center",
+      },
+    },
+  );
 }
 
 function createEnhanceFn(
   ctx: ExtensionCommandContext,
   config: ResolvedEnhanceConfig,
   browseTools: string[],
+  getSelection?: () => PromptGenSelection,
 ): EnhanceFn {
   return async (
     text: string,
@@ -165,16 +203,27 @@ function createEnhanceFn(
     signal?: AbortSignal,
     previousOutput?: string,
     onProgress?: (message: string) => void,
+    selectionOverride?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
   ) => {
     throwIfAborted(signal);
+
+    const selection = resolveEffectiveSelection(config.model, getSelection?.(), selectionOverride);
+    const canReuseConfig = selection.model.provider === config.model.provider &&
+      selection.model.id === config.model.id &&
+      config.apiKey !== undefined;
+    const selectedConfig = canReuseConfig
+      ? config
+      : await resolveEnhanceConfigForModel(ctx, selection.model);
+    if (!selectedConfig) throw new Error(`No API key configured for ${selection.model.provider}.`);
+    const selectedApiKey = selectedConfig.apiKey ?? "";
 
     const browseResult = ctx.cwd
       ? await browseCodebase({
         input: text,
         cwd: ctx.cwd,
-        model: config.model,
-        apiKey: config.apiKey,
-        headers: config.headers,
+        model: selectedConfig.model,
+        apiKey: selectedApiKey,
+        headers: selectedConfig.headers,
         signal,
         tools: browseTools,
         sessionHistory: resolveBrowseSessionHistory(ctx.sessionManager),
@@ -188,10 +237,11 @@ function createEnhanceFn(
       input: text,
       mode,
       cwd: ctx.cwd,
-      model: config.model,
-      apiKey: config.apiKey,
-      headers: config.headers,
+      model: selectedConfig.model,
+      apiKey: selectedApiKey,
+      headers: selectedConfig.headers,
       signal,
+      thinkingLevel: selection.thinkingLevel,
       previousOutput,
       relevantRefs: browseResult.refs,
       gitContext: browseResult.gitContext,
@@ -227,16 +277,30 @@ function createSendFn(
   };
 }
 
-async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<ResolvedEnhanceConfig | undefined> {
+function resolveEnhanceModelConfig(ctx: ExtensionCommandContext): ResolvedEnhanceConfig | undefined {
   const model = ctx.model;
   if (!model) {
     ctx.ui.notify("No active model. Select a model before using /prompt.", "error");
     return undefined;
   }
 
+  return { model };
+}
+
+async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<ResolvedEnhanceConfig | undefined> {
+  const modelConfig = resolveEnhanceModelConfig(ctx);
+  if (!modelConfig) return undefined;
+  return resolveEnhanceConfigForModel(ctx, modelConfig.model, true);
+}
+
+async function resolveEnhanceConfigForModel(
+  ctx: ExtensionCommandContext,
+  model: Model<Api>,
+  notify = false,
+): Promise<ResolvedEnhanceConfig | undefined> {
   const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
   if (!auth.ok) {
-    ctx.ui.notify(`No API key configured for ${model.provider}: ${auth.error}`, "error");
+    if (notify) ctx.ui.notify(`No API key configured for ${model.provider}: ${auth.error}`, "error");
     return undefined;
   }
 
@@ -245,6 +309,158 @@ async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<Resol
     apiKey: auth.apiKey ?? "",
     headers: auth.headers,
   };
+}
+
+function resolveAvailableModels(ctx: ExtensionCommandContext, fallbackModel: Model<Api>): Model<Api>[] {
+  const available = typeof ctx.modelRegistry.getAvailable === "function"
+    ? ctx.modelRegistry.getAvailable()
+    : [];
+  const allModels = Array.isArray(available) ? [...available] : [];
+  const enabledModels = resolveEnabledModelPatterns(ctx);
+  const models = enabledModels?.length ? filterModelsByPatterns(allModels, enabledModels) : allModels;
+  return ensureModelIncluded(models, fallbackModel);
+}
+
+function resolveEnabledModelPatterns(ctx: ExtensionCommandContext): string[] | undefined {
+  try {
+    const settingsManager = SettingsManager.create(ctx.cwd, getAgentDir(), {
+      projectTrusted: ctx.isProjectTrusted(),
+    });
+    return settingsManager.getEnabledModels();
+  } catch {
+    return undefined;
+  }
+}
+
+function filterModelsByPatterns(models: Model<Api>[], patterns: string[]): Model<Api>[] {
+  const result: Model<Api>[] = [];
+  for (const pattern of patterns) {
+    const normalized = stripThinkingSuffix(pattern.trim().toLowerCase());
+    if (!normalized) continue;
+    for (const model of models) {
+      if (!modelMatchesPattern(model, normalized)) continue;
+      if (!result.some((existing) => sameModel(existing, model))) result.push(model);
+    }
+  }
+  return result;
+}
+
+function modelMatchesPattern(model: Model<Api>, pattern: string): boolean {
+  const providerId = `${model.provider}/${model.id}`.toLowerCase();
+  const id = model.id.toLowerCase();
+  const name = model.name.toLowerCase();
+  const provider = model.provider.toLowerCase();
+  return wildcardMatch(providerId, pattern) ||
+    wildcardMatch(id, pattern) ||
+    wildcardMatch(name, pattern) ||
+    wildcardMatch(provider, pattern);
+}
+
+function stripThinkingSuffix(pattern: string): string {
+  const suffixMatch = pattern.match(/:(off|minimal|low|medium|high|xhigh)$/);
+  return suffixMatch ? pattern.slice(0, -suffixMatch[0].length) : pattern;
+}
+
+function wildcardMatch(value: string, pattern: string): boolean {
+  try {
+    // Patterns come from trusted Pi enabledModels settings; non-glob characters
+    // are escaped and matched model/provider strings are short, bounded IDs.
+    const regex = globPatternToRegExp(pattern);
+    return regex.test(value);
+  } catch {
+    return false;
+  }
+}
+
+function globPatternToRegExp(pattern: string): RegExp {
+  let source = "^";
+  for (let i = 0; i < pattern.length; i++) {
+    const ch = pattern[i]!;
+    if (ch === "*") {
+      source += ".*";
+    } else if (ch === "?") {
+      source += ".";
+    } else if (ch === "[") {
+      const close = pattern.indexOf("]", i + 1);
+      if (close > i + 1) {
+        source += pattern.slice(i, close + 1);
+        i = close;
+      } else {
+        source += "\\[";
+      }
+    } else {
+      source += ch.replace(/[.+^${}()|\\]/g, "\\$&");
+    }
+  }
+  return new RegExp(`${source}$`, "i");
+}
+
+function ensureModelIncluded(models: Model<Api>[], fallbackModel: Model<Api>): Model<Api>[] {
+  const result = [...models];
+  if (!result.some((model) => sameModel(model, fallbackModel))) result.unshift(fallbackModel);
+  return result;
+}
+
+function sameModel(a: Model<Api>, b: Model<Api>): boolean {
+  return a.provider === b.provider && a.id === b.id;
+}
+
+function resolveInitialSelection(
+  _ctx: ExtensionCommandContext,
+  availableModels: Model<Api>[],
+  fallbackModel: Model<Api>,
+): PromptGenSelection {
+  const persisted = readPersistedPromptGenSettings();
+  const persistedModel = persisted?.modelProvider && persisted.modelId
+    ? availableModels.find((model) => model.provider === persisted.modelProvider && model.id === persisted.modelId)
+    : undefined;
+  const model = persistedModel ?? fallbackModel;
+  return {
+    model,
+    thinkingLevel: normalizeThinkingLevel(model, persisted?.thinkingLevel),
+  };
+}
+
+function readPersistedPromptGenSettings(): PromptGenPersistedSettings | undefined {
+  try {
+    const raw = readFileSync(getGlobalSettingsPath(), "utf8");
+    const data = JSON.parse(raw) as PromptGenPersistedSettings | undefined;
+    if (!data || typeof data !== "object") return undefined;
+    if (typeof data.modelProvider !== "string" || typeof data.modelId !== "string") return undefined;
+    if (data.thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(data.thinkingLevel)) return undefined;
+    return data;
+  } catch {
+    return undefined;
+  }
+}
+
+function persistPromptGenSelection(selection: PromptGenSelection): void {
+  const path = getGlobalSettingsPath();
+  mkdirSync(dirname(path), { recursive: true });
+  writeFileSync(path, JSON.stringify({
+    modelProvider: selection.model.provider,
+    modelId: selection.model.id,
+    thinkingLevel: selection.thinkingLevel,
+  }, null, 2));
+}
+
+function getGlobalSettingsPath(): string {
+  return join(getAgentDir(), GLOBAL_SETTINGS_FILE);
+}
+
+function resolveEffectiveSelection(
+  defaultModel: Model<Api>,
+  currentSelection?: PromptGenSelection,
+  override?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+): { model: Model<Api>; thinkingLevel?: ModelThinkingLevel } {
+  const model = override?.model ?? currentSelection?.model ?? defaultModel;
+  const explicitLevel = override?.thinkingLevel ?? currentSelection?.thinkingLevel;
+  const thinkingLevel = explicitLevel ? normalizeThinkingLevel(model, explicitLevel) : undefined;
+  return { model, thinkingLevel };
+}
+
+function normalizeThinkingLevel(model: Model<Api>, level: ModelThinkingLevel | undefined): ModelThinkingLevel {
+  return clampThinkingLevel(model, level ?? "off");
 }
 
 function throwIfAborted(signal?: AbortSignal): void {

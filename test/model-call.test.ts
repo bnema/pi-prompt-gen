@@ -23,9 +23,15 @@ import type {
 const mockComplete = vi.fn<
   (model: unknown, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>
 >();
+const mockCompleteSimple = vi.fn<
+  (model: unknown, context: Context, options?: ProviderStreamOptions) => Promise<AssistantMessage>
+>();
+const mockClampThinkingLevel = vi.fn((model: Model<Api>, level: string) => (model.reasoning ? level : "off"));
 
 vi.mock("@earendil-works/pi-ai", () => ({
+  clampThinkingLevel: mockClampThinkingLevel,
   complete: mockComplete,
+  completeSimple: mockCompleteSimple,
 }));
 
 // Import *after* mocking
@@ -36,7 +42,7 @@ import type { ModelCallParams } from "../src/model-call.js";
 // Helpers
 // ---------------------------------------------------------------------------
 
-function makeFakeModel(): Model<Api> {
+function makeFakeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
     id: "test-model",
     name: "Test Model",
@@ -48,6 +54,7 @@ function makeFakeModel(): Model<Api> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 8000,
     maxTokens: 2048,
+    ...overrides,
   };
 }
 
@@ -90,6 +97,8 @@ function makeAssistantMessage(
 describe("makeModelCall", () => {
   beforeEach(() => {
     mockComplete.mockReset();
+    mockCompleteSimple.mockReset();
+    mockClampThinkingLevel.mockClear();
   });
 
   it("calls complete with the model, systemPrompt, user message, and options", async () => {
@@ -106,6 +115,7 @@ describe("makeModelCall", () => {
     });
 
     expect(mockComplete).toHaveBeenCalledTimes(1);
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
 
     const [calledModel, ctx, opts] = mockComplete.mock.calls[0] as [
       Model<Api>,
@@ -222,6 +232,68 @@ describe("makeModelCall", () => {
       makeBasicParams({ headers: undefined, signal: undefined }),
     );
     expect(result.content).toBe("Hello world");
+  });
+
+  it("uses completeSimple with reasoning when thinkingLevel is enabled", async () => {
+    mockCompleteSimple.mockResolvedValue(makeAssistantMessage({
+      content: [{ type: "text", text: "Reasoned response" }],
+    }));
+    const model = makeFakeModel({ reasoning: true });
+    const signal = new AbortController().signal;
+
+    const result = await makeModelCall(makeBasicParams({
+      model,
+      thinkingLevel: "high",
+      headers: { "X-Custom": "value" },
+      signal,
+    }));
+
+    expect(mockComplete).not.toHaveBeenCalled();
+    expect(mockCompleteSimple).toHaveBeenCalledWith(
+      model,
+      expect.objectContaining({
+        messages: expect.arrayContaining([
+          expect.objectContaining({ role: "user" }),
+        ]),
+      }),
+      expect.objectContaining({
+        apiKey: "sk-test-key",
+        headers: { "X-Custom": "value" },
+        signal,
+        reasoning: "high",
+      }),
+    );
+    expect(result.content).toBe("Reasoned response");
+  });
+
+  it("clamps unsupported thinkingLevel to off before choosing provider path", async () => {
+    mockComplete.mockResolvedValue(makeAssistantMessage());
+
+    await makeModelCall(makeBasicParams({
+      model: makeFakeModel({ reasoning: false }),
+      thinkingLevel: "high",
+    }));
+
+    expect(mockComplete).toHaveBeenCalledTimes(1);
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
+  });
+
+  it("keeps thinkingLevel off on the existing complete path", async () => {
+    mockComplete.mockResolvedValue(makeAssistantMessage());
+
+    await makeModelCall(makeBasicParams({ thinkingLevel: "off" }));
+
+    expect(mockComplete).toHaveBeenCalledTimes(1);
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
+  });
+
+  it("rejects invalid runtime thinkingLevel values before calling a provider", async () => {
+    await expect(makeModelCall(makeBasicParams({
+      thinkingLevel: "deep" as unknown as ModelCallParams["thinkingLevel"],
+    }))).rejects.toThrow("Invalid thinking level: deep");
+
+    expect(mockComplete).not.toHaveBeenCalled();
+    expect(mockCompleteSimple).not.toHaveBeenCalled();
   });
 
   it("filters out non-text content blocks", async () => {

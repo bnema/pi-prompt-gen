@@ -2,9 +2,18 @@
  * Tests for extensions/index.ts — extension command registration and wiring.
  */
 
+import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
-import type { Model, Api } from "@earendil-works/pi-ai";
+import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
+
+const testPaths = vi.hoisted(() => ({
+  agentDir: `/tmp/pi-prompt-gen-extension-test-${process.pid}`,
+}));
+
+const settingsMocks = vi.hoisted(() => ({
+  getEnabledModels: vi.fn<() => string[] | undefined>(),
+}));
 
 const mockEnhancePrompt = vi.fn();
 const mockBrowseCodebase = vi.fn();
@@ -36,13 +45,15 @@ vi.mock("../src/modal.js", () => ({
   }),
 }));
 
-vi.mock("@earendil-works/pi-coding-agent", async (importOriginal) => {
-  const actual = await importOriginal() as typeof import("@earendil-works/pi-coding-agent");
-  return {
-    ...actual,
-    copyToClipboard: vi.fn().mockResolvedValue(undefined),
-  };
-});
+vi.mock("@earendil-works/pi-coding-agent", () => ({
+  copyToClipboard: vi.fn().mockResolvedValue(undefined),
+  getAgentDir: vi.fn(() => testPaths.agentDir),
+  SettingsManager: {
+    create: vi.fn(() => ({
+      getEnabledModels: settingsMocks.getEnabledModels,
+    })),
+  },
+}));
 
 const { default: registerPiPromptGen } = await import("../extensions/index.js");
 const { enhancePrompt } = await import("../src/index.js");
@@ -50,7 +61,7 @@ const { browseCodebase } = await import("../src/browse-pass.js");
 const { PromptGenModal } = await import("../src/modal.js");
 const { copyToClipboard } = await import("@earendil-works/pi-coding-agent");
 
-function makeModel(): Model<Api> {
+function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
     id: "test-model",
     name: "Test Model",
@@ -62,6 +73,7 @@ function makeModel(): Model<Api> {
     cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
     contextWindow: 8000,
     maxTokens: 2048,
+    ...overrides,
   };
 }
 
@@ -97,7 +109,7 @@ function makeMockContext(overrides?: Partial<ExtensionCommandContext>): Extensio
     modelRegistry: {
       getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true, apiKey: "sk-test", headers: undefined }),
       getAll: vi.fn(),
-      getAvailable: vi.fn(),
+      getAvailable: vi.fn().mockReturnValue([makeModel()]),
       find: vi.fn(),
       hasConfiguredAuth: vi.fn(),
       getApiKeyForProvider: vi.fn(),
@@ -172,7 +184,9 @@ function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
 }
 
 beforeEach(() => {
+  rmSync(testPaths.agentDir, { recursive: true, force: true });
   vi.clearAllMocks();
+  settingsMocks.getEnabledModels.mockReturnValue(undefined);
   mockBrowseCodebase.mockResolvedValue({
     refs: [],
     gitContext: undefined,
@@ -260,7 +274,7 @@ describe("Command handler — model resolution", () => {
     );
   });
 
-  it("notifies error when API key is missing", async () => {
+  it("notifies error when API key is missing for inline enhancement", async () => {
     const modelRegistry = {
       getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: false, error: "No key for test-provider" }),
     } as any;
@@ -270,7 +284,7 @@ describe("Command handler — model resolution", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("", ctx);
+    await command.handler("fix this prompt", ctx);
 
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       expect.stringContaining("No API key configured"),
@@ -654,6 +668,108 @@ describe("Command handler — sendUserMessage integration", () => {
       "Sent prompt, but failed to clear the editor.",
       "warning",
     );
+  });
+});
+
+describe("Command handler — modal model/thinking persistence", () => {
+  it("passes enabled model settings and persisted thinking into the modal", async () => {
+    const first = makeModel({ id: "gpt-5.5", name: "gpt-5.5", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } });
+    const second = makeModel({ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic", reasoning: true });
+    const third = makeModel({ id: "gemini-pro", name: "Gemini Pro", provider: "google", reasoning: true });
+    mkdirSync(testPaths.agentDir, { recursive: true });
+    writeFileSync(`${testPaths.agentDir}/prompt-gen-settings.json`, JSON.stringify({
+      modelProvider: "anthropic",
+      modelId: "claude-sonnet",
+      thinkingLevel: "high" satisfies ModelThinkingLevel,
+    }));
+    const ctx = makeMockContext({
+      model: first,
+      modelRegistry: {
+        ...makeMockContext().modelRegistry,
+        getAvailable: vi.fn().mockReturnValue([first, second, third]),
+        getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true, apiKey: "sk-test", headers: undefined }),
+      } as any,
+      sessionManager: {
+        getBranch: vi.fn().mockReturnValue([]),
+        getEntries: vi.fn().mockReturnValue([]),
+      } as any,
+    } as Partial<ExtensionCommandContext>);
+    settingsMocks.getEnabledModels.mockReturnValue(["test-provider/gpt-*", "anthropic/*:high"]);
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    expect(PromptGenModal).toHaveBeenCalledWith(expect.objectContaining({
+      availableModels: [first, second],
+      selectedModel: second,
+      selectedThinkingLevel: "high",
+    }));
+  });
+
+  it("persists model and thinking changes globally for later Prompt Gen modals", async () => {
+    const first = makeModel({ id: "gpt-5.5", name: "gpt-5.5", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } });
+    const second = makeModel({ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic", reasoning: true });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    const makeCtx = (cwd: string) => makeMockContext({
+      cwd,
+      model: first,
+      modelRegistry: {
+        ...makeMockContext().modelRegistry,
+        getAvailable: vi.fn().mockReturnValue([first, second]),
+        getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true, apiKey: "sk-test", headers: undefined }),
+      } as any,
+      sessionManager: {
+        getBranch: vi.fn().mockReturnValue([]),
+        getEntries: vi.fn().mockReturnValue([]),
+      } as any,
+    });
+
+    await command.handler("", makeCtx("/project/a"));
+    const firstModalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    firstModalOptions.onSelectionChange({ model: second, thinkingLevel: "high" });
+
+    await command.handler("", makeCtx("/project/b"));
+
+    expect(pi.appendEntry).not.toHaveBeenCalled();
+    expect(PromptGenModal).toHaveBeenLastCalledWith(expect.objectContaining({
+      selectedModel: second,
+      selectedThinkingLevel: "high",
+    }));
+  });
+
+  it("uses persisted modal model and thinking for browse and enhancement", async () => {
+    const first = makeModel({ id: "gpt-5.5", name: "gpt-5.5", reasoning: true, thinkingLevelMap: { xhigh: "xhigh" } });
+    const second = makeModel({ id: "claude-sonnet", name: "Claude Sonnet", provider: "anthropic", reasoning: true });
+    const ctx = makeMockContext({
+      model: first,
+      modelRegistry: {
+        ...makeMockContext().modelRegistry,
+        getAvailable: vi.fn().mockReturnValue([first, second]),
+        getApiKeyAndHeaders: vi.fn().mockResolvedValue({ ok: true, apiKey: "sk-test", headers: undefined }),
+      } as any,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
+    modalOptions.onSelectionChange({ model: second, thinkingLevel: "high" });
+    await modalOptions.enhanceFn("my text", "generate");
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      model: second,
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      model: second,
+      thinkingLevel: "high",
+    }));
   });
 });
 

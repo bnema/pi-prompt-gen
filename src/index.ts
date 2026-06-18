@@ -7,7 +7,7 @@
  * session context.
  */
 
-import type { Api, Model } from "@earendil-works/pi-ai";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { buildEnhancerPrompt, type EnhancerMode, type RelevantRef } from "./enhancer-prompt.js";
 import { makeModelCall, type ModelCallResult } from "./model-call.js";
 
@@ -143,6 +143,8 @@ export interface EnhancePromptOptions {
   headers?: Record<string, string>;
   /** Optional abort signal to cancel the model call. */
   signal?: AbortSignal;
+  /** Optional thinking level for the final enhancement call. */
+  thinkingLevel?: ModelThinkingLevel;
   /** If provided, request a materially different alternative from this prior output. */
   previousOutput?: string;
   /** Optional explicit refs gathered by an upstream browse pass. */
@@ -197,6 +199,7 @@ export async function enhancePrompt(options: EnhancePromptOptions): Promise<Enha
     apiKey,
     headers,
     signal,
+    thinkingLevel,
     previousOutput,
     relevantRefs,
     gitContext,
@@ -230,6 +233,7 @@ export async function enhancePrompt(options: EnhancePromptOptions): Promise<Enha
     apiKey,
     headers,
     signal,
+    thinkingLevel,
     systemPrompt,
     userContent: buildUserContent(input, previousOutput),
   });
