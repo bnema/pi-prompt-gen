@@ -4,7 +4,14 @@
 
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { describe, it, expect, vi, beforeEach } from "vitest";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionUIContext } from "@earendil-works/pi-coding-agent";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+  ExtensionUIContext,
+  InputEvent,
+  InputEventResult,
+} from "@earendil-works/pi-coding-agent";
 import type { Model, Api, ModelThinkingLevel } from "@earendil-works/pi-ai";
 
 const testPaths = vi.hoisted(() => ({
@@ -143,6 +150,25 @@ function makeMockContext(overrides?: Partial<ExtensionCommandContext>): Extensio
   };
 }
 
+function getRegisteredInputHandler(
+  pi: ExtensionAPI,
+): (event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult | void> | InputEventResult | void {
+  const call = (pi.on as ReturnType<typeof vi.fn>).mock.calls.find(
+    (entry: unknown[]) => entry[0] === "input",
+  );
+  if (!call) throw new Error("input handler was not registered");
+  return call[1] as (event: InputEvent, ctx: ExtensionContext) => Promise<InputEventResult | void> | InputEventResult | void;
+}
+
+function makeInputEvent(overrides?: Partial<InputEvent>): InputEvent {
+  return {
+    type: "input",
+    text: "make this prompt better",
+    source: "interactive",
+    ...overrides,
+  };
+}
+
 function makeExtensionAPI(overrides?: Partial<ExtensionAPI>): ExtensionAPI {
   return {
     registerCommand: vi.fn(),
@@ -256,6 +282,136 @@ describe("Extension registration", () => {
       "The global pi-prompt-gen shortcut is available in Pi TUI mode only.",
       "warning",
     );
+  });
+});
+
+describe("Input hook — prompt confirmation", () => {
+  it("asks before enhancing normal outgoing messages", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "normal user prompt" }), ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledWith(
+      "Would you like to enhance this prompt?",
+      ["Yes", "No", "Don't ask again for this session"],
+    );
+    expect(result).toEqual({ action: "continue" });
+  });
+
+  it("continues with the original message unchanged when the user selects No", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "ship the original" }), ctx);
+
+    expect(result).toEqual({ action: "continue" });
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+    expect(copyToClipboard).not.toHaveBeenCalled();
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+  });
+
+  it("enhances and uses the enhanced prompt when the user selects Yes", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
+
+    expect(result).toEqual({ action: "transform", text: "Enhanced result text" });
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "make this clear",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "make this clear",
+      mode: "rewrite",
+    }));
+    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "make this clear");
+    expect(copyToClipboard).toHaveBeenNthCalledWith(2, "Enhanced result text");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("continues unchanged and suppresses future prompts when the user selects Don't ask again for this session", async () => {
+    const select = vi.fn().mockResolvedValue("Don't ask again for this session");
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select,
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const firstResult = await inputHandler(makeInputEvent({ text: "first original" }), ctx);
+    const secondResult = await inputHandler(makeInputEvent({ text: "second original" }), ctx);
+
+    expect(firstResult).toEqual({ action: "continue" });
+    expect(secondResult).toEqual({ action: "continue" });
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not intercept extension-generated messages", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({
+      text: "enhanced prompt from extension",
+      source: "extension",
+    }), ctx);
+
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not intercept slash commands before Pi expands them", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "/skill:example" }), ctx);
+
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
   });
 });
 

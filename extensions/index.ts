@@ -6,7 +6,7 @@
 
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { copyToClipboard, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
 import { clampThinkingLevel, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
 import { browseCodebase, SAFE_BROWSE_TOOL_NAMES, type BrowseSessionHistoryMessage } from "../src/browse-pass.js";
@@ -16,10 +16,13 @@ import { PromptGenModal } from "../src/modal.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
 
 interface ResolvedEnhanceConfig {
-  model: NonNullable<ExtensionCommandContext["model"]>;
+  model: NonNullable<ExtensionContext["model"]>;
   apiKey?: string;
   headers?: Record<string, string>;
 }
+
+type EnhanceContext = Pick<ExtensionContext, "cwd" | "modelRegistry" | "sessionManager" | "ui">;
+type EnhanceModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "ui">;
 
 interface PromptGenPersistedSettings {
   modelProvider?: string;
@@ -47,7 +50,17 @@ const INLINE_STATUS_INTERVAL_MS = 120;
 const EDITOR_WRITE_WARNING = "Enhanced prompt ready, but failed to write to editor.";
 const EDITOR_AND_CLIPBOARD_WARNING = "Enhanced prompt ready, but failed to write to editor or copy to clipboard.";
 const CLIPBOARD_WRITE_WARNING = "Enhanced prompt written to editor, but failed to copy to clipboard.";
+const ENHANCED_COPY_WARNING = "Enhanced prompt ready, but failed to copy to clipboard.";
 const INLINE_INPUT_BACKUP_WARNING = "Could not copy original prompt to clipboard before enhancement; continuing.";
+const INPUT_ENHANCE_CONFIRM_TITLE = "Would you like to enhance this prompt?";
+const INPUT_ENHANCE_YES = "Yes";
+const INPUT_ENHANCE_NO = "No";
+const INPUT_ENHANCE_DISABLE_SESSION = "Don't ask again for this session";
+const INPUT_ENHANCE_CHOICES = [
+  INPUT_ENHANCE_YES,
+  INPUT_ENHANCE_NO,
+  INPUT_ENHANCE_DISABLE_SESSION,
+];
 const NO_UI_ERROR_MESSAGE =
   "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
   "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
@@ -55,6 +68,8 @@ const GLOBAL_SETTINGS_FILE = "prompt-gen-settings.json";
 const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
 
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
+  let inputEnhancementDisabledForSession = false;
+
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     await ctx.waitForIdle();
 
@@ -135,6 +150,44 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       });
     },
   });
+
+  pi.on("input", async (event, ctx) => {
+    if (inputEnhancementDisabledForSession || shouldSkipInputEnhancement(event.source, event.text) || !ctx.hasUI) {
+      return { action: "continue" };
+    }
+
+    const choice = await ctx.ui.select(INPUT_ENHANCE_CONFIRM_TITLE, INPUT_ENHANCE_CHOICES);
+    if (choice === INPUT_ENHANCE_DISABLE_SESSION) {
+      inputEnhancementDisabledForSession = true;
+      return { action: "continue" };
+    }
+    if (choice !== INPUT_ENHANCE_YES) return { action: "continue" };
+
+    const enhanceConfig = await resolveEnhanceConfig(ctx);
+    if (!enhanceConfig) return { action: "continue" };
+
+    const enhancedPrompt = await runInlineEnhancement(
+      ctx,
+      event.text,
+      "rewrite",
+      createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi)),
+      (msg, type) => ctx.ui.notify(msg, type),
+      { writeResultToEditor: false },
+    );
+
+    if (!enhancedPrompt) return { action: "continue" };
+
+    return {
+      action: "transform",
+      text: enhancedPrompt,
+      ...(event.images && event.images.length > 0 ? { images: event.images } : {}),
+    };
+  });
+}
+
+function shouldSkipInputEnhancement(source: string, text: string): boolean {
+  const trimmed = text.trim();
+  return source === "extension" || trimmed.length === 0 || trimmed.startsWith("/");
 }
 
 interface OpenPromptGenModalOptions {
@@ -193,7 +246,7 @@ async function openPromptGenModal(
 }
 
 function createEnhanceFn(
-  ctx: ExtensionCommandContext,
+  ctx: EnhanceContext,
   config: ResolvedEnhanceConfig,
   browseTools: string[],
   getSelection?: () => PromptGenSelection,
@@ -278,7 +331,7 @@ function createSendFn(
   };
 }
 
-function resolveEnhanceModelConfig(ctx: ExtensionCommandContext): ResolvedEnhanceConfig | undefined {
+function resolveEnhanceModelConfig(ctx: EnhanceModelContext): ResolvedEnhanceConfig | undefined {
   const model = ctx.model;
   if (!model) {
     ctx.ui.notify("No active model. Select a model before using /prompt.", "error");
@@ -288,14 +341,14 @@ function resolveEnhanceModelConfig(ctx: ExtensionCommandContext): ResolvedEnhanc
   return { model };
 }
 
-async function resolveEnhanceConfig(ctx: ExtensionCommandContext): Promise<ResolvedEnhanceConfig | undefined> {
+async function resolveEnhanceConfig(ctx: EnhanceModelContext): Promise<ResolvedEnhanceConfig | undefined> {
   const modelConfig = resolveEnhanceModelConfig(ctx);
   if (!modelConfig) return undefined;
   return resolveEnhanceConfigForModel(ctx, modelConfig.model, true);
 }
 
 async function resolveEnhanceConfigForModel(
-  ctx: ExtensionCommandContext,
+  ctx: Pick<ExtensionContext, "modelRegistry" | "ui">,
   model: Model<Api>,
   notify = false,
 ): Promise<ResolvedEnhanceConfig | undefined> {
@@ -521,7 +574,7 @@ function extractMessageText(content: unknown): string {
 }
 
 function resolveBrowseSessionHistory(
-  sessionManager: Pick<ExtensionCommandContext, "sessionManager">["sessionManager"],
+  sessionManager: ExtensionContext["sessionManager"],
 ): BrowseSessionHistoryMessage[] {
   // Browse history must stay scoped to the current branch. Prefill can fall
   // back to getEntries(), but the internal session_history tool should not
@@ -616,13 +669,18 @@ async function runNonTuiFallback(
   await runInlineEnhancement(ctx, text, initialMode, enhanceFn, notify);
 }
 
+interface RunInlineEnhancementOptions {
+  writeResultToEditor?: boolean;
+}
+
 async function runInlineEnhancement(
-  ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">,
+  ctx: Pick<ExtensionContext, "hasUI" | "ui">,
   text: string,
   mode: EnhancerMode,
   enhanceFn: EnhanceFn,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
-): Promise<void> {
+  options: RunInlineEnhancementOptions = {},
+): Promise<string | undefined> {
   if (!ctx.hasUI) {
     throw new Error(NO_UI_ERROR_MESSAGE);
   }
@@ -645,31 +703,42 @@ async function runInlineEnhancement(
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
     progress.stop();
-    return;
+    return undefined;
   }
 
-  try {
-    ctx.ui.setEditorText(output);
-  } catch {
-    progress.stop();
+  const writeResultToEditor = options.writeResultToEditor ?? true;
+
+  if (writeResultToEditor) {
     try {
-      await copyToClipboard(output);
-      notify(EDITOR_WRITE_WARNING, "warning");
-      notify(`Enhanced prompt copied to clipboard.${metadataSummary}`, "info");
+      ctx.ui.setEditorText(output);
     } catch {
-      notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
+      progress.stop();
+      try {
+        await copyToClipboard(output);
+        notify(EDITOR_WRITE_WARNING, "warning");
+        notify(`Enhanced prompt copied to clipboard.${metadataSummary}`, "info");
+      } catch {
+        notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
+      }
+      return output;
     }
-    return;
   }
 
   try {
     await copyToClipboard(output);
-    notify(`Enhanced prompt copied to clipboard and written to editor.${metadataSummary}`, "info");
+    notify(
+      writeResultToEditor
+        ? `Enhanced prompt copied to clipboard and written to editor.${metadataSummary}`
+        : `Enhanced prompt copied to clipboard.${metadataSummary}`,
+      "info",
+    );
   } catch {
-    notify(CLIPBOARD_WRITE_WARNING, "warning");
+    notify(writeResultToEditor ? CLIPBOARD_WRITE_WARNING : ENHANCED_COPY_WARNING, "warning");
   } finally {
     progress.stop();
   }
+
+  return output;
 }
 
 async function backupInlineInputToClipboard(
@@ -684,7 +753,7 @@ async function backupInlineInputToClipboard(
 }
 
 function createInlineStatusReporter(
-  ctx: Pick<ExtensionCommandContext, "ui">,
+  ctx: Pick<ExtensionContext, "ui">,
 ): { update: (message: string) => void; stop: () => void } {
   let message = "Enhancing prompt…";
   let frameIndex = 0;
