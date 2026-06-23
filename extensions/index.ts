@@ -70,6 +70,10 @@ const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "lo
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
 
+  pi.on("session_start", () => {
+    inputEnhancementDisabledForSession = false;
+  });
+
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     await ctx.waitForIdle();
 
@@ -152,7 +156,12 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   });
 
   pi.on("input", async (event, ctx) => {
-    if (inputEnhancementDisabledForSession || shouldSkipInputEnhancement(event.source, event.text) || !ctx.hasUI) {
+    if (
+      inputEnhancementDisabledForSession ||
+      event.streamingBehavior !== undefined ||
+      shouldSkipInputEnhancement(event.source, event.text) ||
+      !ctx.hasUI
+    ) {
       return { action: "continue" };
     }
 
