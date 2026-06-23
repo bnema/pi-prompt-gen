@@ -308,8 +308,24 @@ describe("Command handler — prefill behavior (TUI)", () => {
       input: "fix the sidebar sort",
       mode: "rewrite",
     }));
-    expect(copyToClipboard).toHaveBeenCalledWith("Enhanced result text");
+    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix the sidebar sort");
+    expect(copyToClipboard).toHaveBeenNthCalledWith(2, "Enhanced result text");
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("backs up the original inline input to clipboard before enhancement can fail", async () => {
+    mockEnhancePrompt.mockRejectedValueOnce(new Error("model exploded"));
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("recover this exact prompt", ctx);
+
+    expect(copyToClipboard).toHaveBeenCalledTimes(1);
+    expect(copyToClipboard).toHaveBeenCalledWith("recover this exact prompt");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Enhancement failed: model exploded", "error");
   });
 
   it("prefills from editor text when no args and editor has text", async () => {
@@ -522,7 +538,9 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
   });
 
   it("warns specifically when inline clipboard copy fails after enhancement succeeds", async () => {
-    vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
+    vi.mocked(copyToClipboard)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("copy failed"));
 
     const ctx = makeMockContext({
       mode: "print",
@@ -572,7 +590,9 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
   });
 
   it("warns specifically when inline editor write and clipboard copy both fail", async () => {
-    vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
+    vi.mocked(copyToClipboard)
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("copy failed"));
 
     const ctx = makeMockContext({
       mode: "print",

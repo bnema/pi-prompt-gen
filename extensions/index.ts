@@ -47,6 +47,7 @@ const INLINE_STATUS_INTERVAL_MS = 120;
 const EDITOR_WRITE_WARNING = "Enhanced prompt ready, but failed to write to editor.";
 const EDITOR_AND_CLIPBOARD_WARNING = "Enhanced prompt ready, but failed to write to editor or copy to clipboard.";
 const CLIPBOARD_WRITE_WARNING = "Enhanced prompt written to editor, but failed to copy to clipboard.";
+const INLINE_INPUT_BACKUP_WARNING = "Could not copy original prompt to clipboard before enhancement; continuing.";
 const NO_UI_ERROR_MESSAGE =
   "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
   "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
@@ -628,6 +629,7 @@ async function runInlineEnhancement(
 
   const progress = createInlineStatusReporter(ctx);
   notify("Enhancing prompt…", "info");
+  await backupInlineInputToClipboard(text, notify);
 
   let output: string;
   let metadataSummary = "";
@@ -667,6 +669,17 @@ async function runInlineEnhancement(
     notify(CLIPBOARD_WRITE_WARNING, "warning");
   } finally {
     progress.stop();
+  }
+}
+
+async function backupInlineInputToClipboard(
+  text: string,
+  notify: (msg: string, type?: "info" | "warning" | "error") => void,
+): Promise<void> {
+  try {
+    await copyToClipboard(text);
+  } catch {
+    notify(INLINE_INPUT_BACKUP_WARNING, "warning");
   }
 }
 
