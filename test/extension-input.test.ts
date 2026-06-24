@@ -369,6 +369,153 @@ describe("Input hook — prompt confirmation", () => {
     expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
   });
 
+  it("handles Escape during browse by aborting, restoring original input, and not sending stale text", async () => {
+    let resolveBrowse!: (value: { refs: [] }) => void;
+    const browsePromise = new Promise<{ refs: [] }>((resolve) => {
+      resolveBrowse = resolve;
+    });
+    mockBrowseCodebase.mockReturnValueOnce(browsePromise);
+
+    const unsubscribe = vi.fn();
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+      onTerminalInput: vi.fn().mockReturnValue(unsubscribe),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const resultPromise = inputHandler(makeInputEvent({ text: "exact original sentence" }), ctx);
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
+      expect(browseCodebase).toHaveBeenCalledTimes(1);
+    });
+
+    const browseSignal = (browseCodebase as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0].signal as AbortSignal;
+    const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
+    expect(terminalHandler("x")).toBeUndefined();
+    expect(terminalHandler("\u001b")).toEqual({ consume: true });
+
+    const result = await resultPromise;
+    expect(result).toEqual({ action: "handled" });
+    expect(browseSignal.aborted).toBe(true);
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("exact original sentence");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhancement cancelled; restored original prompt.",
+      "info",
+    );
+    expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-prompt-gen", undefined);
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+
+    resolveBrowse({ refs: [] });
+    await Promise.resolve();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+    expect(copyToClipboard).toHaveBeenCalledTimes(1);
+    expect(copyToClipboard).toHaveBeenCalledWith("exact original sentence");
+    expect(copyToClipboard).not.toHaveBeenCalledWith("Enhanced result text");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("warns and still cancels when restoring original input fails", async () => {
+    let resolveBrowse!: (value: { refs: [] }) => void;
+    mockBrowseCodebase.mockReturnValueOnce(new Promise<{ refs: [] }>((resolve) => {
+      resolveBrowse = resolve;
+    }));
+
+    const unsubscribe = vi.fn();
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+      onTerminalInput: vi.fn().mockReturnValue(unsubscribe),
+      setEditorText: vi.fn(() => {
+        throw new Error("editor restore failed");
+      }),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const resultPromise = inputHandler(makeInputEvent({ text: "restore fallback prompt" }), ctx);
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
+      expect(browseCodebase).toHaveBeenCalledTimes(1);
+    });
+
+    const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
+    expect(() => terminalHandler("\u001b")).not.toThrow();
+
+    const result = await resultPromise;
+    expect(result).toEqual({ action: "handled" });
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.",
+      "warning",
+    );
+
+    resolveBrowse({ refs: [] });
+    await Promise.resolve();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("ignores a stale enhancement result that resolves after Escape cancellation", async () => {
+    let resolveEnhance!: (value: Awaited<ReturnType<typeof mockEnhancePrompt>>) => void;
+    mockEnhancePrompt.mockReturnValueOnce(new Promise((resolve) => {
+      resolveEnhance = resolve;
+    }));
+
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const resultPromise = inputHandler(makeInputEvent({ text: "original that should remain" }), ctx);
+
+    await vi.waitFor(() => {
+      expect(enhancePrompt).toHaveBeenCalledTimes(1);
+    });
+
+    const enhanceSignal = (enhancePrompt as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0].signal as AbortSignal;
+    const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
+    expect(terminalHandler("\u001b")).toEqual({ consume: true });
+
+    const result = await resultPromise;
+    expect(result).toEqual({ action: "handled" });
+    expect(enhanceSignal.aborted).toBe(true);
+
+    resolveEnhance({
+      enhancedPrompt: "late enhanced text",
+      refs: [],
+      gitContext: undefined,
+      sessionContext: undefined,
+      systemPrompt: "",
+      modelResult: { content: "late enhanced text", stopReason: "stop" },
+      metadata: {
+        modelId: "test-model",
+        modelName: "Test Model",
+        modelProvider: "test-provider",
+        latencyMs: 500,
+        refCount: 0,
+        stopReason: "stop",
+      },
+    });
+    await Promise.resolve();
+
+    expect(copyToClipboard).toHaveBeenCalledTimes(1);
+    expect(copyToClipboard).toHaveBeenCalledWith("original that should remain");
+    expect(copyToClipboard).not.toHaveBeenCalledWith("late enhanced text");
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("original that should remain");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("late enhanced text");
+  });
+
   it("continues unchanged and suppresses future prompts when the user selects Don't ask again for this session", async () => {
     const select = vi.fn().mockResolvedValue("Don't ask again for this session");
     const ctx = makeMockContext({
