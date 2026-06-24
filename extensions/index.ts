@@ -761,7 +761,11 @@ async function runInlineEnhancement(
   });
 
   notify("Enhancing prompt…", "info");
-  inputBackupSucceeded = await backupInlineInputToClipboard(text, notify);
+  const backupResult = await Promise.race([
+    backupInlineInputToClipboard(text, notify),
+    cancelledPromise,
+  ]);
+  if (typeof backupResult === "boolean") inputBackupSucceeded = backupResult;
   if (cancelled) return { status: "cancelled" };
 
   let metadataSummary = "";

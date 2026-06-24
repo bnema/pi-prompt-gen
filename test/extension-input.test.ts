@@ -373,6 +373,47 @@ describe("Input hook — prompt confirmation", () => {
     expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
   });
 
+  it("handles Escape without waiting for a pending input backup", async () => {
+    let resolveBackup!: () => void;
+    const backupPromise = new Promise<void>((resolve) => {
+      resolveBackup = resolve;
+    });
+    vi.mocked(copyToClipboard).mockReturnValueOnce(backupPromise);
+    const unsubscribe = vi.fn();
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+      onTerminalInput: vi.fn().mockReturnValue(unsubscribe),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const resultPromise = Promise.resolve(inputHandler(makeInputEvent({ text: "backup pending prompt" }), ctx));
+    let settledResult: InputEventResult | void | undefined;
+    resultPromise.then((result) => {
+      settledResult = result;
+    });
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
+    });
+
+    const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
+    expect(terminalHandler("\u001b")).toEqual({ consume: true });
+    await flushAsyncWork();
+
+    expect(settledResult).toEqual({ action: "handled" });
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("backup pending prompt");
+    expect(unsubscribe).toHaveBeenCalledTimes(1);
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+
+    resolveBackup();
+    await resultPromise;
+  });
+
   it("handles Escape during browse by aborting, restoring original input, and not sending stale text", async () => {
     let resolveBrowse!: (value: { refs: [] }) => void;
     const browsePromise = new Promise<{ refs: [] }>((resolve) => {
