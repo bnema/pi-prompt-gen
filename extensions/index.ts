@@ -52,6 +52,13 @@ const EDITOR_AND_CLIPBOARD_WARNING = "Enhanced prompt ready, but failed to write
 const CLIPBOARD_WRITE_WARNING = "Enhanced prompt written to editor, but failed to copy to clipboard.";
 const ENHANCED_COPY_WARNING = "Enhanced prompt ready, but failed to copy to clipboard.";
 const INLINE_INPUT_BACKUP_WARNING = "Could not copy original prompt to clipboard before enhancement; continuing.";
+const INLINE_CANCELLED_NOTICE = "Enhancement cancelled; restored original prompt.";
+const INLINE_CANCEL_RESTORE_WARNING =
+  "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.";
+const INLINE_CANCEL_RESTORE_WITHOUT_BACKUP_WARNING =
+  "Enhancement cancelled, but failed to restore original prompt. The original prompt could not be copied to clipboard before enhancement.";
+const INLINE_EMPTY_RESULT_WARNING = "Enhancement returned an empty prompt; restored original prompt.";
+const INLINE_EMPTY_RESULT_RESTORE_WARNING = "Enhancement returned an empty prompt and failed to restore original prompt.";
 const INPUT_ENHANCE_CONFIRM_TITLE = "Would you like to enhance this prompt?";
 const INPUT_ENHANCE_YES = "Yes";
 const INPUT_ENHANCE_NO = "No";
@@ -71,10 +78,12 @@ const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "lo
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
   let inputEnhancementDefaultChoice: InputEnhanceDefaultChoice = INPUT_ENHANCE_YES;
+  let skipNextInputEnhancement = false;
 
   pi.on("session_start", () => {
     inputEnhancementDisabledForSession = false;
     inputEnhancementDefaultChoice = INPUT_ENHANCE_YES;
+    skipNextInputEnhancement = false;
   });
 
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -159,6 +168,11 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   });
 
   pi.on("input", async (event, ctx) => {
+    if (skipNextInputEnhancement && event.streamingBehavior === undefined && event.source !== "extension") {
+      skipNextInputEnhancement = false;
+      return { action: "continue" };
+    }
+
     if (
       inputEnhancementDisabledForSession ||
       event.streamingBehavior !== undefined ||
@@ -186,22 +200,20 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     const enhanceConfig = await resolveEnhanceConfig(ctx);
     if (!enhanceConfig) return { action: "continue" };
 
-    const enhancedPrompt = await runInlineEnhancement(
+    const outcome = await runInlineEnhancement(
       ctx,
       event.text,
       "rewrite",
       createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi)),
       (msg, type) => ctx.ui.notify(msg, type),
-      { writeResultToEditor: false, writeResultToClipboard: false },
+      { writeResultToEditor: true, writeResultToClipboard: false },
     );
 
-    if (!enhancedPrompt) return { action: "continue" };
+    if (outcome.status === "cancelled" || outcome.status === "empty") return { action: "handled" };
+    if (outcome.status !== "enhanced") return { action: "continue" };
 
-    return {
-      action: "transform",
-      text: enhancedPrompt,
-      ...(event.images && event.images.length > 0 ? { images: event.images } : {}),
-    };
+    skipNextInputEnhancement = true;
+    return { action: "handled" };
   });
 }
 
@@ -703,6 +715,12 @@ interface RunInlineEnhancementOptions {
   writeResultToClipboard?: boolean;
 }
 
+type InlineEnhancementOutcome =
+  | { status: "enhanced"; text: string }
+  | { status: "cancelled" }
+  | { status: "empty" }
+  | { status: "failed" };
+
 async function runInlineEnhancement(
   ctx: Pick<ExtensionContext, "hasUI" | "ui">,
   text: string,
@@ -710,55 +728,132 @@ async function runInlineEnhancement(
   enhanceFn: EnhanceFn,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
   options: RunInlineEnhancementOptions = {},
-): Promise<string | undefined> {
+): Promise<InlineEnhancementOutcome> {
   if (!ctx.hasUI) {
     throw new Error(NO_UI_ERROR_MESSAGE);
   }
 
+  const abortController = new AbortController();
   const progress = createInlineStatusReporter(ctx);
-  notify("Enhancing prompt…", "info");
-  await backupInlineInputToClipboard(text, notify);
+  let cancelled = false;
+  let inputBackupSucceeded = false;
+  let unsubscribeInput: (() => void) | undefined;
+  let resolveCancelled!: () => void;
+  const cancelledPromise = new Promise<{ status: "cancelled" }>((resolve) => {
+    resolveCancelled = () => resolve({ status: "cancelled" });
+  });
+  const cancelInlineEnhancement = () => {
+    if (cancelled) return;
+    cancelled = true;
+    abortController.abort();
+    try {
+      ctx.ui.setEditorText(text);
+      notify(INLINE_CANCELLED_NOTICE, "info");
+    } catch {
+      notify(
+        inputBackupSucceeded ? INLINE_CANCEL_RESTORE_WARNING : INLINE_CANCEL_RESTORE_WITHOUT_BACKUP_WARNING,
+        "warning",
+      );
+    } finally {
+      progress.stop();
+      unsubscribeInput?.();
+      resolveCancelled();
+    }
+  };
 
-  let output: string;
+  unsubscribeInput = ctx.ui.onTerminalInput((data) => {
+    if (data !== "\u001b") return undefined;
+    cancelInlineEnhancement();
+    return { consume: true };
+  });
+
+  notify("Enhancing prompt…", "info");
+  const backupResult = await Promise.race([
+    backupInlineInputToClipboard(text, notify),
+    cancelledPromise,
+  ]);
+  if (typeof backupResult === "boolean") inputBackupSucceeded = backupResult;
+  if (cancelled) return { status: "cancelled" };
+
   let metadataSummary = "";
+  const enhancePromise = enhanceFn(text, mode, abortController.signal, undefined, (message) => {
+    if (!cancelled) progress.update(message);
+  });
+  enhancePromise.catch(() => undefined);
+
   try {
-    const result = await enhanceFn(text, mode, undefined, undefined, (message) => {
-      progress.update(message);
-    });
-    output = result.enhancedPrompt;
+    const result = await Promise.race([enhancePromise, cancelledPromise]);
+    if (!("enhancedPrompt" in result) || cancelled) return { status: "cancelled" };
+
+    const output = result.enhancedPrompt;
+    if (!output.trim()) {
+      try {
+        ctx.ui.setEditorText(text);
+        notify(INLINE_EMPTY_RESULT_WARNING, "warning");
+      } catch {
+        notify(INLINE_EMPTY_RESULT_RESTORE_WARNING, "warning");
+      }
+      return { status: "empty" };
+    }
+
     // Build compact metadata summary for notification.
     const metaParts = buildMetadataSummaryParts(result.metadata);
     if (metaParts.length > 0) metadataSummary = ` \u00b7 ${metaParts.join(" \u00b7 ")}`;
+
+    if (cancelled) return { status: "cancelled" };
+    await writeInlineEnhancementResult(ctx, output, metadataSummary, notify, options, () => cancelled);
+    if (cancelled) return { status: "cancelled" };
+    return { status: "enhanced", text: output };
   } catch (err) {
+    if (cancelled || abortController.signal.aborted) {
+      cancelInlineEnhancement();
+      return { status: "cancelled" };
+    }
     const msg = err instanceof Error ? err.message : String(err);
     notify(`Enhancement failed: ${msg}`, "error");
-    progress.stop();
-    return undefined;
+    return { status: "failed" };
+  } finally {
+    if (!cancelled) {
+      progress.stop();
+      unsubscribeInput?.();
+    }
   }
+}
 
+async function writeInlineEnhancementResult(
+  ctx: Pick<ExtensionContext, "ui">,
+  output: string,
+  metadataSummary: string,
+  notify: (msg: string, type?: "info" | "warning" | "error") => void,
+  options: RunInlineEnhancementOptions,
+  isCancelled: () => boolean,
+): Promise<void> {
   const writeResultToEditor = options.writeResultToEditor ?? true;
   const writeResultToClipboard = options.writeResultToClipboard ?? true;
 
+  if (isCancelled()) return;
   if (writeResultToEditor) {
     try {
       ctx.ui.setEditorText(output);
     } catch {
-      progress.stop();
+      if (isCancelled()) return;
       if (!writeResultToClipboard) {
         notify(EDITOR_WRITE_WARNING, "warning");
-        return output;
+        return;
       }
       try {
         await copyToClipboard(output);
+        if (isCancelled()) return;
         notify(EDITOR_WRITE_WARNING, "warning");
         notify(`Enhanced prompt copied to clipboard.${metadataSummary}`, "info");
       } catch {
-        notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
+        if (!isCancelled()) notify(EDITOR_AND_CLIPBOARD_WARNING, "warning");
       }
-      return output;
+      return;
     }
   }
 
+  if (isCancelled()) return;
   if (!writeResultToClipboard) {
     notify(
       writeResultToEditor
@@ -766,12 +861,12 @@ async function runInlineEnhancement(
         : `Enhanced prompt ready.${metadataSummary}`,
       "info",
     );
-    progress.stop();
-    return output;
+    return;
   }
 
   try {
     await copyToClipboard(output);
+    if (isCancelled()) return;
     notify(
       writeResultToEditor
         ? `Enhanced prompt copied to clipboard and written to editor.${metadataSummary}`
@@ -779,22 +874,20 @@ async function runInlineEnhancement(
       "info",
     );
   } catch {
-    notify(writeResultToEditor ? CLIPBOARD_WRITE_WARNING : ENHANCED_COPY_WARNING, "warning");
-  } finally {
-    progress.stop();
+    if (!isCancelled()) notify(writeResultToEditor ? CLIPBOARD_WRITE_WARNING : ENHANCED_COPY_WARNING, "warning");
   }
-
-  return output;
 }
 
 async function backupInlineInputToClipboard(
   text: string,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await copyToClipboard(text);
+    return true;
   } catch {
     notify(INLINE_INPUT_BACKUP_WARNING, "warning");
+    return false;
   }
 }
 
