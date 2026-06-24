@@ -206,6 +206,10 @@ function makeInputEvent(overrides?: Partial<InputEvent>): InputEvent {
   };
 }
 
+function flushAsyncWork(): Promise<void> {
+  return new Promise((resolve) => setImmediate(resolve));
+}
+
 beforeEach(() => {
   rmSync(testPaths.agentDir, { recursive: true, force: true });
   vi.clearAllMocks();
@@ -411,7 +415,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(unsubscribe).toHaveBeenCalledTimes(1);
 
     resolveBrowse({ refs: [] });
-    await Promise.resolve();
+    await flushAsyncWork();
     expect(enhancePrompt).not.toHaveBeenCalled();
     expect(copyToClipboard).toHaveBeenCalledTimes(1);
     expect(copyToClipboard).toHaveBeenCalledWith("exact original sentence");
@@ -458,8 +462,80 @@ describe("Input hook — prompt confirmation", () => {
     );
 
     resolveBrowse({ refs: [] });
-    await Promise.resolve();
+    await flushAsyncWork();
     expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not claim clipboard recovery when backup and editor restore both fail", async () => {
+    vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
+    let resolveBrowse!: (value: { refs: [] }) => void;
+    mockBrowseCodebase.mockReturnValueOnce(new Promise<{ refs: [] }>((resolve) => {
+      resolveBrowse = resolve;
+    }));
+
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+      setEditorText: vi.fn(() => {
+        throw new Error("editor restore failed");
+      }),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const resultPromise = inputHandler(makeInputEvent({ text: "no backup prompt" }), ctx);
+
+    await vi.waitFor(() => {
+      expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
+      expect(browseCodebase).toHaveBeenCalledTimes(1);
+    });
+
+    const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
+    expect(terminalHandler("\u001b")).toEqual({ consume: true });
+
+    const result = await resultPromise;
+    expect(result).toEqual({ action: "handled" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Could not copy original prompt to clipboard before enhancement; continuing.",
+      "warning",
+    );
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhancement cancelled, but failed to restore original prompt. The original prompt could not be copied to clipboard before enhancement.",
+      "warning",
+    );
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.",
+      "warning",
+    );
+
+    resolveBrowse({ refs: [] });
+    await flushAsyncWork();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("treats provider AbortError as an enhancement failure unless the inline signal was aborted", async () => {
+    mockEnhancePrompt.mockRejectedValueOnce(new DOMException("provider aborted", "AbortError"));
+
+    const ui = {
+      ...makeMockContext().ui,
+      select: vi.fn().mockResolvedValue("Yes"),
+    } as ExtensionUIContext;
+    const ctx = makeMockContext({ ui });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "provider abort prompt" }), ctx);
+
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.ui.notify).toHaveBeenCalledWith("Enhancement failed: provider aborted", "error");
+    expect(ctx.ui.notify).not.toHaveBeenCalledWith(
+      "Enhancement cancelled; restored original prompt.",
+      "info",
+    );
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("provider abort prompt");
   });
 
   it("ignores a stale enhancement result that resolves after Escape cancellation", async () => {
@@ -507,7 +583,7 @@ describe("Input hook — prompt confirmation", () => {
         stopReason: "stop",
       },
     });
-    await Promise.resolve();
+    await flushAsyncWork();
 
     expect(copyToClipboard).toHaveBeenCalledTimes(1);
     expect(copyToClipboard).toHaveBeenCalledWith("original that should remain");

@@ -55,6 +55,8 @@ const INLINE_INPUT_BACKUP_WARNING = "Could not copy original prompt to clipboard
 const INLINE_CANCELLED_NOTICE = "Enhancement cancelled; restored original prompt.";
 const INLINE_CANCEL_RESTORE_WARNING =
   "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.";
+const INLINE_CANCEL_RESTORE_WITHOUT_BACKUP_WARNING =
+  "Enhancement cancelled, but failed to restore original prompt. The original prompt could not be copied to clipboard before enhancement.";
 const INPUT_ENHANCE_CONFIRM_TITLE = "Would you like to enhance this prompt?";
 const INPUT_ENHANCE_YES = "Yes";
 const INPUT_ENHANCE_NO = "No";
@@ -727,6 +729,7 @@ async function runInlineEnhancement(
   const abortController = new AbortController();
   const progress = createInlineStatusReporter(ctx);
   let cancelled = false;
+  let inputBackupSucceeded = false;
   let unsubscribeInput: (() => void) | undefined;
   let resolveCancelled!: () => void;
   const cancelledPromise = new Promise<{ status: "cancelled" }>((resolve) => {
@@ -740,7 +743,10 @@ async function runInlineEnhancement(
       ctx.ui.setEditorText(text);
       notify(INLINE_CANCELLED_NOTICE, "info");
     } catch {
-      notify(INLINE_CANCEL_RESTORE_WARNING, "warning");
+      notify(
+        inputBackupSucceeded ? INLINE_CANCEL_RESTORE_WARNING : INLINE_CANCEL_RESTORE_WITHOUT_BACKUP_WARNING,
+        "warning",
+      );
     } finally {
       progress.stop();
       unsubscribeInput?.();
@@ -755,7 +761,7 @@ async function runInlineEnhancement(
   });
 
   notify("Enhancing prompt…", "info");
-  await backupInlineInputToClipboard(text, notify);
+  inputBackupSucceeded = await backupInlineInputToClipboard(text, notify);
   if (cancelled) return { status: "cancelled" };
 
   let metadataSummary = "";
@@ -778,7 +784,7 @@ async function runInlineEnhancement(
     if (cancelled) return { status: "cancelled" };
     return { status: "enhanced", text: output };
   } catch (err) {
-    if (cancelled || isAbortError(err)) {
+    if (cancelled || abortController.signal.aborted) {
       cancelInlineEnhancement();
       return { status: "cancelled" };
     }
@@ -851,18 +857,16 @@ async function writeInlineEnhancementResult(
   }
 }
 
-function isAbortError(err: unknown): boolean {
-  return err instanceof Error && (err.name === "AbortError" || err.message === "AbortError");
-}
-
 async function backupInlineInputToClipboard(
   text: string,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
-): Promise<void> {
+): Promise<boolean> {
   try {
     await copyToClipboard(text);
+    return true;
   } catch {
     notify(INLINE_INPUT_BACKUP_WARNING, "warning");
+    return false;
   }
 }
 
