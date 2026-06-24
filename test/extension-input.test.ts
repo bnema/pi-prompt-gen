@@ -314,7 +314,8 @@ describe("Input hook — prompt confirmation", () => {
     const result = await inputHandler(makeInputEvent({ text: "enhance second prompt" }), ctx);
 
     expect(select).toHaveBeenNthCalledWith(2, "Would you like to enhance this prompt?", INPUT_CHOICES_WITH_NO_DEFAULT);
-    expect(result).toEqual({ action: "transform", text: "Enhanced result text" });
+    expect(result).toEqual({ action: "handled" });
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "enhance second prompt",
       mode: "rewrite",
@@ -345,7 +346,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(select).toHaveBeenNthCalledWith(3, "Would you like to enhance this prompt?", INPUT_CHOICES);
   });
 
-  it("enhances and uses the enhanced prompt when the user selects Yes", async () => {
+  it("enhances and resurfaces the enhanced prompt in the editor when the user selects Yes", async () => {
     const ctx = makeMockContext({
       ui: {
         ...makeMockContext().ui,
@@ -358,7 +359,7 @@ describe("Input hook — prompt confirmation", () => {
     const inputHandler = getRegisteredInputHandler(pi);
     const result = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
 
-    expect(result).toEqual({ action: "transform", text: "Enhanced result text" });
+    expect(result).toEqual({ action: "handled" });
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       input: "make this clear",
       cwd: "/test/project",
@@ -370,7 +371,66 @@ describe("Input hook — prompt confirmation", () => {
     expect(copyToClipboard).toHaveBeenCalledTimes(1);
     expect(copyToClipboard).toHaveBeenCalledWith("make this clear");
     expect(copyToClipboard).not.toHaveBeenCalledWith("Enhanced result text");
-    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("does not ask to enhance the next submitted resurfaced prompt", async () => {
+    const select = vi.fn().mockResolvedValue("Yes");
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select,
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const firstResult = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
+    const secondResult = await inputHandler(makeInputEvent({ text: "Enhanced result text" }), ctx);
+
+    expect(firstResult).toEqual({ action: "handled" });
+    expect(secondResult).toEqual({ action: "continue" });
+    expect(select).toHaveBeenCalledTimes(1);
+    expect(enhancePrompt).toHaveBeenCalledTimes(1);
+  });
+
+  it("restores the original input instead of transforming to an empty enhanced prompt", async () => {
+    mockEnhancePrompt.mockResolvedValueOnce({
+      enhancedPrompt: "   ",
+      refs: [],
+      gitContext: undefined,
+      sessionContext: undefined,
+      systemPrompt: "",
+      modelResult: { content: "   ", stopReason: "stop" },
+      metadata: {
+        modelId: "test-model",
+        modelName: "Test Model",
+        modelProvider: "test-provider",
+        latencyMs: 500,
+        refCount: 0,
+        stopReason: "stop",
+      },
+    });
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "test" }), ctx);
+
+    expect(result).toEqual({ action: "handled" });
+    expect(ctx.ui.setEditorText).toHaveBeenCalledWith("test");
+    expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("   ");
+    expect(ctx.ui.notify).toHaveBeenCalledWith(
+      "Enhancement returned an empty prompt; restored original prompt.",
+      "warning",
+    );
   });
 
   it("handles Escape without waiting for a pending input backup", async () => {

@@ -57,6 +57,8 @@ const INLINE_CANCEL_RESTORE_WARNING =
   "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.";
 const INLINE_CANCEL_RESTORE_WITHOUT_BACKUP_WARNING =
   "Enhancement cancelled, but failed to restore original prompt. The original prompt could not be copied to clipboard before enhancement.";
+const INLINE_EMPTY_RESULT_WARNING = "Enhancement returned an empty prompt; restored original prompt.";
+const INLINE_EMPTY_RESULT_RESTORE_WARNING = "Enhancement returned an empty prompt and failed to restore original prompt.";
 const INPUT_ENHANCE_CONFIRM_TITLE = "Would you like to enhance this prompt?";
 const INPUT_ENHANCE_YES = "Yes";
 const INPUT_ENHANCE_NO = "No";
@@ -76,10 +78,12 @@ const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "lo
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
   let inputEnhancementDefaultChoice: InputEnhanceDefaultChoice = INPUT_ENHANCE_YES;
+  let skipNextInputEnhancement = false;
 
   pi.on("session_start", () => {
     inputEnhancementDisabledForSession = false;
     inputEnhancementDefaultChoice = INPUT_ENHANCE_YES;
+    skipNextInputEnhancement = false;
   });
 
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -164,6 +168,11 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   });
 
   pi.on("input", async (event, ctx) => {
+    if (skipNextInputEnhancement && event.streamingBehavior === undefined && event.source !== "extension") {
+      skipNextInputEnhancement = false;
+      return { action: "continue" };
+    }
+
     if (
       inputEnhancementDisabledForSession ||
       event.streamingBehavior !== undefined ||
@@ -197,17 +206,14 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       "rewrite",
       createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi)),
       (msg, type) => ctx.ui.notify(msg, type),
-      { writeResultToEditor: false, writeResultToClipboard: false },
+      { writeResultToEditor: true, writeResultToClipboard: false },
     );
 
-    if (outcome.status === "cancelled") return { action: "handled" };
+    if (outcome.status === "cancelled" || outcome.status === "empty") return { action: "handled" };
     if (outcome.status !== "enhanced") return { action: "continue" };
 
-    return {
-      action: "transform",
-      text: outcome.text,
-      ...(event.images && event.images.length > 0 ? { images: event.images } : {}),
-    };
+    skipNextInputEnhancement = true;
+    return { action: "handled" };
   });
 }
 
@@ -712,6 +718,7 @@ interface RunInlineEnhancementOptions {
 type InlineEnhancementOutcome =
   | { status: "enhanced"; text: string }
   | { status: "cancelled" }
+  | { status: "empty" }
   | { status: "failed" };
 
 async function runInlineEnhancement(
@@ -779,6 +786,16 @@ async function runInlineEnhancement(
     if (!("enhancedPrompt" in result) || cancelled) return { status: "cancelled" };
 
     const output = result.enhancedPrompt;
+    if (!output.trim()) {
+      try {
+        ctx.ui.setEditorText(text);
+        notify(INLINE_EMPTY_RESULT_WARNING, "warning");
+      } catch {
+        notify(INLINE_EMPTY_RESULT_RESTORE_WARNING, "warning");
+      }
+      return { status: "empty" };
+    }
+
     // Build compact metadata summary for notification.
     const metaParts = buildMetadataSummaryParts(result.metadata);
     if (metaParts.length > 0) metadataSummary = ` \u00b7 ${metaParts.join(" \u00b7 ")}`;
