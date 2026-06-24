@@ -68,6 +68,7 @@ const { browseCodebase } = await import("../src/browse-pass.js");
 const { copyToClipboard } = await import("@earendil-works/pi-coding-agent");
 
 const INPUT_CHOICES = ["Yes", "No", "Don't ask again for this session"];
+const INPUT_CHOICES_WITH_NO_DEFAULT = ["No", "Yes", "Don't ask again for this session"];
 
 function makeModel(overrides?: Partial<Model<Api>>): Model<Api> {
   return {
@@ -270,6 +271,76 @@ describe("Input hook — prompt confirmation", () => {
     expect(ctx.ui.setEditorText).not.toHaveBeenCalled();
   });
 
+  it("defaults to No on the next input confirmation after the user selects No", async () => {
+    const select = vi.fn().mockResolvedValue("No");
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select,
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+
+    await inputHandler(makeInputEvent({ text: "first original" }), ctx);
+    await inputHandler(makeInputEvent({ text: "second original" }), ctx);
+
+    expect(select).toHaveBeenNthCalledWith(1, "Would you like to enhance this prompt?", INPUT_CHOICES);
+    expect(select).toHaveBeenNthCalledWith(2, "Would you like to enhance this prompt?", INPUT_CHOICES_WITH_NO_DEFAULT);
+  });
+
+  it("still allows choosing Yes when No is the session default", async () => {
+    const select = vi.fn()
+      .mockResolvedValueOnce("No")
+      .mockResolvedValueOnce("Yes");
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select,
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+
+    await inputHandler(makeInputEvent({ text: "first original" }), ctx);
+    const result = await inputHandler(makeInputEvent({ text: "enhance second prompt" }), ctx);
+
+    expect(select).toHaveBeenNthCalledWith(2, "Would you like to enhance this prompt?", INPUT_CHOICES_WITH_NO_DEFAULT);
+    expect(result).toEqual({ action: "transform", text: "Enhanced result text" });
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "enhance second prompt",
+      mode: "rewrite",
+    }));
+  });
+
+  it("resets the remembered No default on session_start", async () => {
+    const select = vi.fn().mockResolvedValue("No");
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select,
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const sessionStartHandler = getRegisteredSessionStartHandler(pi);
+
+    await inputHandler(makeInputEvent({ text: "first original" }), ctx);
+    await inputHandler(makeInputEvent({ text: "second original" }), ctx);
+    await sessionStartHandler({ type: "session_start", reason: "new" }, ctx);
+    await inputHandler(makeInputEvent({ text: "third original" }), ctx);
+
+    expect(select).toHaveBeenNthCalledWith(1, "Would you like to enhance this prompt?", INPUT_CHOICES);
+    expect(select).toHaveBeenNthCalledWith(2, "Would you like to enhance this prompt?", INPUT_CHOICES_WITH_NO_DEFAULT);
+    expect(select).toHaveBeenNthCalledWith(3, "Would you like to enhance this prompt?", INPUT_CHOICES);
+  });
+
   it("enhances and uses the enhanced prompt when the user selects Yes", async () => {
     const ctx = makeMockContext({
       ui: {
@@ -292,8 +363,9 @@ describe("Input hook — prompt confirmation", () => {
       input: "make this clear",
       mode: "rewrite",
     }));
-    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "make this clear");
-    expect(copyToClipboard).toHaveBeenNthCalledWith(2, "Enhanced result text");
+    expect(copyToClipboard).toHaveBeenCalledTimes(1);
+    expect(copyToClipboard).toHaveBeenCalledWith("make this clear");
+    expect(copyToClipboard).not.toHaveBeenCalledWith("Enhanced result text");
     expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("Enhanced result text");
   });
 

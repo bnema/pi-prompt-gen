@@ -61,6 +61,7 @@ const INPUT_ENHANCE_CHOICES = [
   INPUT_ENHANCE_NO,
   INPUT_ENHANCE_DISABLE_SESSION,
 ];
+type InputEnhanceDefaultChoice = typeof INPUT_ENHANCE_YES | typeof INPUT_ENHANCE_NO;
 const NO_UI_ERROR_MESSAGE =
   "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
   "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
@@ -69,9 +70,11 @@ const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "lo
 
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
+  let inputEnhancementDefaultChoice: InputEnhanceDefaultChoice = INPUT_ENHANCE_YES;
 
   pi.on("session_start", () => {
     inputEnhancementDisabledForSession = false;
+    inputEnhancementDefaultChoice = INPUT_ENHANCE_YES;
   });
 
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -165,12 +168,20 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       return { action: "continue" };
     }
 
-    const choice = await ctx.ui.select(INPUT_ENHANCE_CONFIRM_TITLE, INPUT_ENHANCE_CHOICES);
+    const choice = await ctx.ui.select(
+      INPUT_ENHANCE_CONFIRM_TITLE,
+      inputEnhanceChoicesForDefault(inputEnhancementDefaultChoice),
+    );
     if (choice === INPUT_ENHANCE_DISABLE_SESSION) {
       inputEnhancementDisabledForSession = true;
       return { action: "continue" };
     }
+    if (choice === INPUT_ENHANCE_NO) {
+      inputEnhancementDefaultChoice = INPUT_ENHANCE_NO;
+      return { action: "continue" };
+    }
     if (choice !== INPUT_ENHANCE_YES) return { action: "continue" };
+    inputEnhancementDefaultChoice = INPUT_ENHANCE_YES;
 
     const enhanceConfig = await resolveEnhanceConfig(ctx);
     if (!enhanceConfig) return { action: "continue" };
@@ -181,7 +192,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       "rewrite",
       createEnhanceFn(ctx, enhanceConfig, resolveBrowseToolNames(pi)),
       (msg, type) => ctx.ui.notify(msg, type),
-      { writeResultToEditor: false },
+      { writeResultToEditor: false, writeResultToClipboard: false },
     );
 
     if (!enhancedPrompt) return { action: "continue" };
@@ -197,6 +208,13 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 function shouldSkipInputEnhancement(source: string, text: string): boolean {
   const trimmed = text.trim();
   return source === "extension" || trimmed.length === 0 || trimmed.startsWith("/");
+}
+
+function inputEnhanceChoicesForDefault(defaultChoice: InputEnhanceDefaultChoice): string[] {
+  if (defaultChoice === INPUT_ENHANCE_NO) {
+    return [INPUT_ENHANCE_NO, INPUT_ENHANCE_YES, INPUT_ENHANCE_DISABLE_SESSION];
+  }
+  return INPUT_ENHANCE_CHOICES;
 }
 
 interface OpenPromptGenModalOptions {
@@ -675,11 +693,14 @@ async function runNonTuiFallback(
     return;
   }
 
-  await runInlineEnhancement(ctx, text, initialMode, enhanceFn, notify);
+  await runInlineEnhancement(ctx, text, initialMode, enhanceFn, notify, {
+    writeResultToClipboard: true,
+  });
 }
 
 interface RunInlineEnhancementOptions {
   writeResultToEditor?: boolean;
+  writeResultToClipboard?: boolean;
 }
 
 async function runInlineEnhancement(
@@ -716,12 +737,17 @@ async function runInlineEnhancement(
   }
 
   const writeResultToEditor = options.writeResultToEditor ?? true;
+  const writeResultToClipboard = options.writeResultToClipboard ?? true;
 
   if (writeResultToEditor) {
     try {
       ctx.ui.setEditorText(output);
     } catch {
       progress.stop();
+      if (!writeResultToClipboard) {
+        notify(EDITOR_WRITE_WARNING, "warning");
+        return output;
+      }
       try {
         await copyToClipboard(output);
         notify(EDITOR_WRITE_WARNING, "warning");
@@ -731,6 +757,17 @@ async function runInlineEnhancement(
       }
       return output;
     }
+  }
+
+  if (!writeResultToClipboard) {
+    notify(
+      writeResultToEditor
+        ? `Enhanced prompt written to editor.${metadataSummary}`
+        : `Enhanced prompt ready.${metadataSummary}`,
+      "info",
+    );
+    progress.stop();
+    return output;
   }
 
   try {
