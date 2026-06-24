@@ -56,7 +56,7 @@ Run the full enhancer inline with a plain string argument:
 /prompt fix the sidebar sorting by recent first
 ```
 
-That inline path reuses the same isolated browse + enhance pipeline as the modal, shows live footer status/progress while it runs, then copies the result to the clipboard and writes it back into the Pi editor.
+That inline path reuses the same isolated browse + enhance pipeline as the modal, shows live footer status/progress while it runs, first copies the original inline input to the clipboard as a recovery backup, then copies the enhanced result to the clipboard and writes it back into the Pi editor on success.
 
 Global shortcut registered by the extension:
 
