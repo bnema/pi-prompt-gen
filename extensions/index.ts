@@ -42,6 +42,17 @@ interface ModelRegistryWithProviderKey {
 }
 
 
+function onCompatEvent<TEvent>(
+  pi: ExtensionAPI,
+  eventName: string,
+  handler: (event: TEvent, ctx: ExtensionContext) => void | Promise<void>,
+): void {
+  const compatPi = pi as unknown as {
+    on(event: string, handler: (event: TEvent, ctx: ExtensionContext) => void | Promise<void>): void;
+  };
+  compatPi.on(eventName, handler);
+}
+
 type EnhanceContext = Pick<ExtensionContext, "cwd" | "modelRegistry" | "sessionManager" | "ui">;
 type EnhanceModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "ui">;
 
@@ -115,11 +126,34 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
   let inputEnhancementDefaultChoice: InputEnhanceDefaultChoice = INPUT_ENHANCE_YES;
   let skipNextInputEnhancement = false;
+  let autoCompactionInProgress = false;
+  let manualCompactionInProgress = false;
 
   pi.on("session_start", () => {
     inputEnhancementDisabledForSession = false;
     inputEnhancementDefaultChoice = INPUT_ENHANCE_YES;
     skipNextInputEnhancement = false;
+    autoCompactionInProgress = false;
+    manualCompactionInProgress = false;
+  });
+
+  onCompatEvent(pi, "auto_compaction_start", () => {
+    autoCompactionInProgress = true;
+  });
+
+  onCompatEvent(pi, "auto_compaction_end", () => {
+    autoCompactionInProgress = false;
+  });
+
+  onCompatEvent<{ signal: AbortSignal }>(pi, "session_before_compact", (event) => {
+    manualCompactionInProgress = true;
+    event.signal.addEventListener("abort", () => {
+      manualCompactionInProgress = false;
+    }, { once: true });
+  });
+
+  onCompatEvent(pi, "session_compact", () => {
+    manualCompactionInProgress = false;
   });
 
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
@@ -209,10 +243,13 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     }
 
     if (
+      autoCompactionInProgress ||
+      manualCompactionInProgress ||
       inputEnhancementDisabledForSession ||
       event.streamingBehavior !== undefined ||
       shouldSkipInputEnhancement(event.source, event.text) ||
-      !ctx.hasUI
+      !ctx.hasUI ||
+      !ctx.isIdle()
     ) {
       return { action: "continue" };
     }
