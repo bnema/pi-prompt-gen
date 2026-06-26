@@ -233,10 +233,10 @@ describe("Extension registration", () => {
     expect(ctx.ui.custom).toHaveBeenCalledTimes(1);
   });
 
-  it("rejects the global shortcut in non-TUI mode before resolving model auth", async () => {
+  it("rejects the global shortcut without interactive UI before resolving model auth", async () => {
     const getApiKeyAndHeaders = vi.fn().mockResolvedValue({ ok: false, error: "should not run" });
     const ctx = makeMockContext({
-      mode: "print",
+      hasUI: false,
       waitForIdle: undefined as any,
       modelRegistry: {
         ...makeMockContext().modelRegistry,
@@ -251,7 +251,7 @@ describe("Extension registration", () => {
 
     expect(getApiKeyAndHeaders).not.toHaveBeenCalled();
     expect(ctx.ui.notify).toHaveBeenCalledWith(
-      "The global pi-prompt-gen shortcut is available in Pi TUI mode only.",
+      "The global pi-prompt-gen shortcut is available in interactive UI mode only.",
       "warning",
     );
   });
@@ -288,6 +288,31 @@ describe("Command handler — model resolution", () => {
       expect.stringContaining("No API key configured"),
       "error",
     );
+  });
+
+  it("uses provider-key model registry fallback for OMP-compatible hosts", async () => {
+    const getApiKeyForProvider = vi.fn().mockResolvedValue("sk-provider");
+    const model = makeModel({ id: "gpt-5.5", provider: "openai" });
+    const ctx = makeMockContext({
+      model,
+      modelRegistry: {
+        getAvailable: vi.fn().mockReturnValue([model]),
+        getApiKeyForProvider,
+      } as never,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("fix this prompt", ctx);
+
+    expect(getApiKeyForProvider).toHaveBeenCalledWith("openai", undefined, {
+      baseUrl: model.baseUrl,
+      modelId: "gpt-5.5",
+    });
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      apiKey: "sk-provider",
+    }));
   });
 });
 
@@ -410,6 +435,19 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     await command.handler("", ctx);
 
     expect(ctx.ui.custom).toHaveBeenCalled();
+  });
+
+  it("uses modal in OMP interactive mode when no args are provided", async () => {
+    const ctx = makeMockContext({ mode: "interactive" as ExtensionCommandContext["mode"], hasUI: true });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("", ctx);
+
+    expect(ctx.ui.custom).toHaveBeenCalled();
+    expect(ctx.ui.editor).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
   });
 
   it("shows inline status progress while enhancing args", async () => {

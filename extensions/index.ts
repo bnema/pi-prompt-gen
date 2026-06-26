@@ -7,12 +7,13 @@
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
-import { copyToClipboard, getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
-import { clampThinkingLevel, type Api, type Model, type ModelThinkingLevel } from "@earendil-works/pi-ai";
-import { browseCodebase, SAFE_BROWSE_TOOL_NAMES, type BrowseSessionHistoryMessage } from "../src/browse-pass.js";
+import { getAgentDir, SettingsManager } from "@earendil-works/pi-coding-agent";
+import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
+import type { BrowseCodebaseOptions, BrowseCodebaseResult, BrowseSessionHistoryMessage } from "../src/browse-pass.js";
 import { enhancePrompt } from "../src/index.js";
 import { buildMetadataSummaryParts } from "../src/debug-artifact.js";
 import { PromptGenModal } from "../src/modal.js";
+import { clampThinkingLevel } from "../src/thinking-level.js";
 import type { EnhancerMode } from "../src/enhancer-prompt.js";
 
 interface ResolvedEnhanceConfig {
@@ -20,6 +21,26 @@ interface ResolvedEnhanceConfig {
   apiKey?: string;
   headers?: Record<string, string>;
 }
+
+interface ResolvedModelAuth {
+  ok: boolean;
+  apiKey?: string;
+  headers?: Record<string, string>;
+  error?: string;
+}
+
+interface ModelRegistryWithAuthHeaders {
+  getApiKeyAndHeaders(model: Model<Api>): Promise<ResolvedModelAuth>;
+}
+
+interface ModelRegistryWithProviderKey {
+  getApiKeyForProvider(
+    provider: string,
+    sessionId?: string,
+    options?: { baseUrl?: string; modelId?: string },
+  ): Promise<string | undefined> | string | undefined;
+}
+
 
 type EnhanceContext = Pick<ExtensionContext, "cwd" | "modelRegistry" | "sessionManager" | "ui">;
 type EnhanceModelContext = Pick<ExtensionContext, "model" | "modelRegistry" | "ui">;
@@ -69,11 +90,26 @@ const INPUT_ENHANCE_CHOICES = [
   INPUT_ENHANCE_DISABLE_SESSION,
 ];
 type InputEnhanceDefaultChoice = typeof INPUT_ENHANCE_YES | typeof INPUT_ENHANCE_NO;
+const HANDLED_INPUT_RESULT = { action: "handled", handled: true } as const;
+
 const NO_UI_ERROR_MESSAGE =
   "The /prompt command requires Pi TUI or an interactive UI-capable mode. " +
   "Use Pi TUI for the modal, or provide text inside a UI-capable session.";
 const GLOBAL_SETTINGS_FILE = "prompt-gen-settings.json";
 const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+const SAFE_BROWSE_TOOL_NAMES = Object.freeze([
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "code_search",
+  "project_memory_read",
+  "project_memory_search",
+  "codegraph_explore",
+  "codegraph_node",
+  "codegraph_status",
+] as const);
+
 
 export default function registerPiPromptGen(pi: ExtensionAPI): void {
   let inputEnhancementDisabledForSession = false;
@@ -103,7 +139,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       return;
     }
 
-    if (ctx.mode !== "tui") {
+    if (!canOpenPromptGenModal(ctx)) {
       const enhanceConfig = await resolveEnhanceConfig(ctx);
       if (!enhanceConfig) return;
       await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify);
@@ -147,9 +183,8 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       const initialText = resolveShortcutPrefill(ctx);
       const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
       const initialTextLabel = resolveShortcutPrefillLabel(ctx);
-
-      if (ctx.mode !== "tui") {
-        ctx.ui.notify("The global pi-prompt-gen shortcut is available in Pi TUI mode only.", "warning");
+      if (!canOpenPromptGenModal(ctx as ExtensionCommandContext)) {
+        ctx.ui.notify("The global pi-prompt-gen shortcut is available in interactive UI mode only.", "warning");
         return;
       }
 
@@ -209,12 +244,20 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       { writeResultToEditor: true, writeResultToClipboard: false },
     );
 
-    if (outcome.status === "cancelled" || outcome.status === "empty") return { action: "handled" };
+    if (outcome.status === "cancelled" || outcome.status === "empty") return HANDLED_INPUT_RESULT;
     if (outcome.status !== "enhanced") return { action: "continue" };
 
+    scheduleEditorTextRestore(ctx, outcome.text);
     skipNextInputEnhancement = true;
-    return { action: "handled" };
+    return HANDLED_INPUT_RESULT;
   });
+}
+
+function canOpenPromptGenModal(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">): boolean {
+  return ctx.hasUI &&
+    typeof ctx.ui.custom === "function" &&
+    typeof ctx.ui.setEditorText === "function" &&
+    typeof ctx.ui.getEditorText === "function";
 }
 
 function shouldSkipInputEnhancement(source: string, text: string): boolean {
@@ -260,7 +303,7 @@ async function openPromptGenModal(
       currentSelection = selection;
       persistSelection();
     },
-    copyFn: copyToClipboard,
+    copyFn: copyTextToClipboard,
     applyFn: (text: string) => {
       ctx.ui.setEditorText(text);
     },
@@ -311,7 +354,7 @@ function createEnhanceFn(
     const selectedApiKey = selectedConfig.apiKey ?? "";
 
     const browseResult = ctx.cwd
-      ? await browseCodebase({
+      ? await runOptionalBrowseCodebase({
         input: text,
         cwd: ctx.cwd,
         model: selectedConfig.model,
@@ -348,6 +391,26 @@ function createEnhanceFn(
       },
     };
   };
+}
+
+async function runOptionalBrowseCodebase(options: BrowseCodebaseOptions): Promise<BrowseCodebaseResult> {
+  try {
+    // The browse pass uses Pi internals that can differ between vanilla Pi and OMP hosts.
+    // Delay loading it so /prompt still registers, then fall back without refs.
+    const { browseCodebase } = await import("../src/browse-pass.js");
+    return await browseCodebase(options);
+  } catch {
+    options.onProgress?.("Skipping codebase browse; continuing without repo refs…");
+    return { refs: [] };
+  }
+}
+
+async function copyTextToClipboard(text: string): Promise<void> {
+  // Clipboard helpers are not exported by every Pi-compatible host shim.
+  // Load lazily so command registration survives on hosts without clipboard support.
+  const { copyToClipboard: hostCopyToClipboard } = await import("@earendil-works/pi-coding-agent");
+  if (typeof hostCopyToClipboard !== "function") throw new Error("Clipboard helper is unavailable.");
+  await hostCopyToClipboard(text);
 }
 
 function resolveBrowseToolNames(pi: ExtensionAPI): string[] {
@@ -391,7 +454,7 @@ async function resolveEnhanceConfigForModel(
   model: Model<Api>,
   notify = false,
 ): Promise<ResolvedEnhanceConfig | undefined> {
-  const auth = await ctx.modelRegistry.getApiKeyAndHeaders(model);
+  const auth = await resolveModelAuth(ctx.modelRegistry, model);
   if (!auth.ok) {
     if (notify) ctx.ui.notify(`No API key configured for ${model.provider}: ${auth.error}`, "error");
     return undefined;
@@ -402,6 +465,33 @@ async function resolveEnhanceConfigForModel(
     apiKey: auth.apiKey ?? "",
     headers: auth.headers,
   };
+}
+
+async function resolveModelAuth(modelRegistry: unknown, model: Model<Api>): Promise<ResolvedModelAuth> {
+  if (hasApiKeyAndHeaders(modelRegistry)) {
+    return modelRegistry.getApiKeyAndHeaders(model);
+  }
+
+  if (!hasProviderKey(modelRegistry)) {
+    return { ok: false, error: "model registry cannot resolve provider credentials" };
+  }
+
+  const apiKey = await modelRegistry.getApiKeyForProvider(model.provider, undefined, {
+    baseUrl: model.baseUrl,
+    modelId: model.id,
+  });
+  if (!apiKey) return { ok: false, error: `No key for ${model.provider}` };
+  return { ok: true, apiKey, headers: undefined };
+}
+
+function hasApiKeyAndHeaders(value: unknown): value is ModelRegistryWithAuthHeaders {
+  return Boolean(value && typeof value === "object" && "getApiKeyAndHeaders" in value &&
+    typeof value.getApiKeyAndHeaders === "function");
+}
+
+function hasProviderKey(value: unknown): value is ModelRegistryWithProviderKey {
+  return Boolean(value && typeof value === "object" && "getApiKeyForProvider" in value &&
+    typeof value.getApiKeyForProvider === "function");
 }
 
 function resolveAvailableModels(ctx: ExtensionCommandContext, fallbackModel: Model<Api>): Model<Api>[] {
@@ -842,7 +932,7 @@ async function writeInlineEnhancementResult(
         return;
       }
       try {
-        await copyToClipboard(output);
+        await copyTextToClipboard(output);
         if (isCancelled()) return;
         notify(EDITOR_WRITE_WARNING, "warning");
         notify(`Enhanced prompt copied to clipboard.${metadataSummary}`, "info");
@@ -865,7 +955,7 @@ async function writeInlineEnhancementResult(
   }
 
   try {
-    await copyToClipboard(output);
+    await copyTextToClipboard(output);
     if (isCancelled()) return;
     notify(
       writeResultToEditor
@@ -883,13 +973,24 @@ async function backupInlineInputToClipboard(
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
 ): Promise<boolean> {
   try {
-    await copyToClipboard(text);
+    await copyTextToClipboard(text);
     return true;
   } catch {
     notify(INLINE_INPUT_BACKUP_WARNING, "warning");
     return false;
   }
 }
+
+function scheduleEditorTextRestore(ctx: Pick<ExtensionContext, "ui">, text: string): void {
+  setImmediate(() => {
+    try {
+      ctx.ui.setEditorText(text);
+    } catch {
+      // Best-effort OMP compatibility: the immediate write path already reported success/failure.
+    }
+  });
+}
+
 
 function createInlineStatusReporter(
   ctx: Pick<ExtensionContext, "ui">,

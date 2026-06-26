@@ -6,9 +6,8 @@
  * conversation ids, and no dependency on sessionManager.
  */
 
-import { clampThinkingLevel, complete, completeSimple, type Api, type Message, type Model, type ModelThinkingLevel, type StopReason, type Usage } from "@earendil-works/pi-ai";
-
-const VALID_THINKING_LEVELS = new Set<ModelThinkingLevel>(["off", "minimal", "low", "medium", "high", "xhigh"]);
+import { complete, completeSimple, type Api, type Message, type Model, type ModelThinkingLevel, type StopReason, type Usage } from "@earendil-works/pi-ai";
+import { clampThinkingLevel, isValidThinkingLevel } from "./thinking-level.js";
 
 /**
  * Parameters for an isolated model call.
@@ -69,7 +68,7 @@ export interface ModelCallResult {
 export async function makeModelCall(params: ModelCallParams): Promise<ModelCallResult> {
 	const { model, apiKey, headers, signal, thinkingLevel, systemPrompt, userContent } = params;
 
-	if (thinkingLevel !== undefined && !VALID_THINKING_LEVELS.has(thinkingLevel)) {
+	if (thinkingLevel !== undefined && !isValidThinkingLevel(thinkingLevel)) {
 		throw new Error(`Invalid thinking level: ${String(thinkingLevel)}`);
 	}
 	const effectiveThinkingLevel = thinkingLevel !== undefined ? clampThinkingLevel(model, thinkingLevel) : undefined;

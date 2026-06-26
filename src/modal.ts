@@ -34,7 +34,7 @@
  */
 
 import type { Component as TuiComponent } from "@earendil-works/pi-tui";
-import { decodeKittyPrintable, Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
+import { Key, matchesKey, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import type { Api, Model, ModelThinkingLevel } from "@earendil-works/pi-ai";
 import type { EnhancePromptResult } from "./index.js";
@@ -42,6 +42,25 @@ import type { EnhancerMode } from "./enhancer-prompt.js";
 import { buildDebugArtifact, buildMetadataSummaryParts } from "./debug-artifact.js";
 import { PromptModelSelectionController } from "./model-selection.js";
 import { wrapToWidth, type WrappedLine } from "./text-wrap.js";
+
+function decodeKittyPrintable(data: string): string | undefined {
+  if (data.length === 1) {
+    const codePoint = data.codePointAt(0);
+    return codePoint !== undefined && codePoint >= 0x20 && codePoint !== 0x7f ? data : undefined;
+  }
+
+  const match = /^\x1b\[(\d+)(?:;\d+)?u$/.exec(data);
+  if (!match?.[1]) return undefined;
+
+  const codePoint = Number.parseInt(match[1], 10);
+  if (!Number.isFinite(codePoint) || codePoint < 0x20 || codePoint === 0x7f) return undefined;
+
+  try {
+    return String.fromCodePoint(codePoint);
+  } catch {
+    return undefined;
+  }
+}
 
 // ---------------------------------------------------------------------------
 // Types
