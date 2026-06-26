@@ -178,7 +178,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     if (!canOpenPromptGenModal(ctx)) {
       const enhanceConfig = await resolveEnhanceConfig(ctx);
       if (!enhanceConfig) return;
-      await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify);
+      await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, { browse: parsedArgs.browse });
       return;
     }
 
@@ -294,27 +294,21 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
 }
 
 function parsePromptCommandArgs(args: string): PromptCommandArgs {
-  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  let rest = args.trim();
   let browse = false;
-  let index = 0;
 
-  for (; index < tokens.length; index++) {
-    const token = tokens[index];
-    if (token === "--") {
-      index += 1;
-      break;
-    }
-    if (token === "--browse" || token === "-b") {
-      browse = true;
-      continue;
-    }
-    break;
+  while (rest) {
+    if (rest === "--") return { browse, text: "" };
+    if (rest.startsWith("-- ")) return { browse, text: rest.slice(3).trim() };
+
+    const flagMatch = /^(--browse|-b)(?=$|\s)/.exec(rest);
+    if (!flagMatch) break;
+
+    browse = true;
+    rest = rest.slice(flagMatch[0].length).replace(/^\s+/, "");
   }
 
-  return {
-    browse,
-    text: tokens.slice(index).join(" "),
-  };
+  return { browse, text: rest.trim() };
 }
 
 function canOpenPromptGenModal(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">): boolean {
@@ -824,6 +818,7 @@ async function runNonTuiFallback(
   initialMode: EnhancerMode,
   enhanceFn: EnhanceFn,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
+  enhanceOptions?: { browse?: boolean },
 ): Promise<void> {
   if (!ctx.hasUI) {
     throw new Error(NO_UI_ERROR_MESSAGE);
@@ -854,7 +849,7 @@ async function runNonTuiFallback(
 
   await runInlineEnhancement(ctx, text, initialMode, enhanceFn, notify, {
     writeResultToClipboard: true,
-  });
+  }, enhanceOptions);
 }
 
 interface RunInlineEnhancementOptions {

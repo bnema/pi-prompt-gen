@@ -392,6 +392,23 @@ describe("Command handler — prefill behavior (TUI)", () => {
     }));
   });
 
+  it("preserves prompt whitespace after leading browse flags", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse   fix   the\nsidebar sort", ctx);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix   the\nsidebar sort",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix   the\nsidebar sort",
+    }));
+    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix   the\nsidebar sort");
+  });
+
   it("backs up the original inline input to clipboard before enhancement can fail", async () => {
     mockEnhancePrompt.mockRejectedValueOnce(new Error("model exploded"));
     const ctx = makeMockContext();
@@ -573,6 +590,33 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     expect(ctx.ui.custom).not.toHaveBeenCalled();
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "test input",
+      mode: "rewrite",
+    }));
+  });
+
+  it("keeps --browse enabled through non-TUI fallback with prefilled text", async () => {
+    const ctx = makeMockContext({
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        ...makeMockContext().ui,
+        custom: undefined as never,
+        getEditorText: vi.fn().mockReturnValue("prefilled prompt"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse", ctx);
+
+    expect(ctx.ui.custom).toBeUndefined();
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "prefilled prompt",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "prefilled prompt",
       mode: "rewrite",
     }));
   });
