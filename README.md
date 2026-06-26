@@ -6,8 +6,9 @@ Generate or rewrite prompts inside Pi with a modal prompt enhancer.
 
 - rewrites a weak prompt without changing its core intent
 - generates a solid prompt from a rough idea or vague issue statement
-- runs a real read-only browse pass before enhancement to inspect the codebase
-- reuses the currently selected Pi model for both browsing and final prompt generation
+- runs fast prompt-only enhancement by default
+- can opt into a real read-only browse pass when repo context is useful
+- reuses the currently selected Pi model for both optional browsing and final prompt generation
 - can use a safe local browse-tool subset when those tools are available in Pi: `read`, `grep`, `find`, `ls`, `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, and `codegraph_status`
 - adds internal bounded read-only browse tools for current git context and current-branch user/assistant session history
 - keeps enhancement calls isolated from the parent session id and does not reuse full parent history
@@ -50,13 +51,26 @@ Open the modal with:
 /prompt
 ```
 
-Run the full enhancer inline with a plain string argument:
+Run the fast prompt-only enhancer inline with a plain string argument:
 
 ```text
 /prompt fix the sidebar sorting by recent first
 ```
 
-That inline path reuses the same isolated browse + enhance pipeline as the modal, shows live footer status/progress while it runs, first copies the original inline input to the clipboard as a recovery backup, then copies the enhanced result to the clipboard and writes it back into the Pi editor on success.
+That inline path skips repo browsing by default, first copies the original inline input to the clipboard as a recovery backup, then copies the enhanced result to the clipboard and writes it back into the Pi editor on success.
+
+Opt into repo browsing when the enhanced prompt should be grounded in local files, git status, or recent session context:
+
+```text
+/prompt --browse fix the sidebar sorting by recent first
+/prompt -b fix the sidebar sorting by recent first
+```
+
+Use `--` when the prompt text itself starts with a flag-like word:
+
+```text
+/prompt -- --browse should stay in the prompt text
+```
 
 Global shortcut registered by the extension:
 
@@ -80,7 +94,9 @@ Default mode:
 
 ## Browse pass
 
-Before generating the final enhanced prompt, `pi-prompt-gen` can run an isolated read-only browse pass. That pass can:
+By default, `pi-prompt-gen` does not browse the repository. This keeps simple prompt rewrites fast and predictable.
+
+When explicitly enabled with `/prompt --browse`, `/prompt -b`, or the modal repo-context toggle, `pi-prompt-gen` can run an isolated read-only browse pass before generating the final enhanced prompt. That pass can:
 
 - inspect the repository with read-only file tools when available: `read`, `grep`, `find`, `ls`
 - use local code and project-discovery tools when available: `code_search`, `project_memory_read`, `project_memory_search`, `codegraph_explore`, `codegraph_node`, `codegraph_status`
@@ -143,6 +159,7 @@ Mode labels are explicit in the UI:
 - `Enter` — enhance the current draft, then re-enhance after a result exists
 - `Shift+Enter` — insert newline
 - `Alt+M` — toggle rewrite/generate mode
+- `Alt+B` — toggle repo-context browsing for modal enhancements
 - `Ctrl+P` — cycle the prompt generator model
 - `Shift+T` — cycle the prompt generator thinking level
 - `Alt+R` — regenerate a materially different alternative with a fresh isolated request
@@ -164,10 +181,10 @@ If the preview is truncated, the modal tells you that the hidden lines still cou
 The enhancement pipeline uses explicit inputs only:
 
 - the selected model
-- the current cwd for the isolated browse pass
+- the current cwd for the optional isolated browse pass
 - the raw user draft as the user message
 - the rewrite/generate guardrail harness as the system prompt
-- a bounded structured browse result: relevant file refs plus optional concise git/session context selected by the scout
+- when browsing is enabled, a bounded structured browse result: relevant file refs plus optional concise git/session context selected by the scout
 
 It does **not** reuse the parent session id, parent session history wholesale, or the full conversation tree.
 

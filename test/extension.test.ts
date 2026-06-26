@@ -317,7 +317,7 @@ describe("Command handler — model resolution", () => {
 });
 
 describe("Command handler — prefill behavior (TUI)", () => {
-  it("runs inline enhancement immediately when args are provided", async () => {
+  it("runs inline enhancement immediately without browsing when plain args are provided", async () => {
     const ctx = makeMockContext();
     const pi = makeExtensionAPI();
 
@@ -327,13 +327,86 @@ describe("Command handler — prefill behavior (TUI)", () => {
 
     expect(PromptGenModal).not.toHaveBeenCalled();
     expect(ctx.ui.custom).not.toHaveBeenCalled();
+    expect(browseCodebase).not.toHaveBeenCalled();
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "fix the sidebar sort",
       mode: "rewrite",
+      relevantRefs: [],
+      gitContext: undefined,
+      sessionContext: undefined,
     }));
     expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix the sidebar sort");
     expect(copyToClipboard).toHaveBeenNthCalledWith(2, "Enhanced result text");
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("runs inline enhancement with repo browsing when --browse is provided", async () => {
+    mockBrowseCodebase.mockResolvedValueOnce({
+      refs: [{ path: "src/sidebar.ts", score: 95, isEntrypoint: true }],
+      gitContext: { branch: "feat/sidebar" },
+      sessionContext: undefined,
+    });
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse fix the sidebar sort", ctx);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort",
+      relevantRefs: [{ path: "src/sidebar.ts", score: 95, isEntrypoint: true }],
+      gitContext: { branch: "feat/sidebar" },
+    }));
+    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix the sidebar sort");
+  });
+
+  it("accepts -b as a short browse flag", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("-b fix the sidebar sort", ctx);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort",
+    }));
+  });
+
+  it("treats -- after flags as literal prompt text", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("-- --browse should stay in the prompt", ctx);
+
+    expect(browseCodebase).not.toHaveBeenCalled();
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "--browse should stay in the prompt",
+    }));
+  });
+
+  it("preserves prompt whitespace after leading browse flags", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse   fix   the\nsidebar sort", ctx);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix   the\nsidebar sort",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix   the\nsidebar sort",
+    }));
+    expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix   the\nsidebar sort");
   });
 
   it("backs up the original inline input to clipboard before enhancement can fail", async () => {
@@ -423,6 +496,30 @@ describe("Command handler — prefill behavior (TUI)", () => {
       mode: "generate",
     }));
   });
+
+  it("opens the modal with repo context enabled when --browse is provided without inline text", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        getEditorText: vi.fn().mockReturnValue(""),
+      } as ExtensionUIContext,
+      sessionManager: {
+        getBranch: vi.fn().mockReturnValue([]),
+        getEntries: vi.fn().mockReturnValue([]),
+      } as any,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse", ctx);
+
+    expect(PromptGenModal).toHaveBeenCalledWith(expect.objectContaining({
+      initialText: "",
+      mode: "generate",
+      initialBrowseEnabled: true,
+    }));
+  });
 });
 
 describe("Command handler — TUI vs non-TUI fallback", () => {
@@ -462,7 +559,7 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
 
     registerPiPromptGen(pi);
     const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
-    await command.handler("test", ctx);
+    await command.handler("--browse test", ctx);
 
     expect(ctx.ui.setStatus).toHaveBeenCalledWith(
       "pi-prompt-gen",
@@ -493,6 +590,33 @@ describe("Command handler — TUI vs non-TUI fallback", () => {
     expect(ctx.ui.custom).not.toHaveBeenCalled();
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "test input",
+      mode: "rewrite",
+    }));
+  });
+
+  it("keeps --browse enabled through non-TUI fallback with prefilled text", async () => {
+    const ctx = makeMockContext({
+      mode: "rpc",
+      hasUI: true,
+      ui: {
+        ...makeMockContext().ui,
+        custom: undefined as never,
+        getEditorText: vi.fn().mockReturnValue("prefilled prompt"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("--browse", ctx);
+
+    expect(ctx.ui.custom).toBeUndefined();
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "prefilled prompt",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "prefilled prompt",
       mode: "rewrite",
     }));
   });
@@ -817,7 +941,7 @@ describe("Command handler — modal model/thinking persistence", () => {
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     modalOptions.onSelectionChange({ model: second, thinkingLevel: "high" });
-    await modalOptions.enhanceFn("my text", "generate");
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       model: second,
@@ -857,7 +981,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    const enhanced = await modalOptions.enhanceFn("my text", "generate");
+    const enhanced = await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       input: "my text",
@@ -916,7 +1040,7 @@ describe("Command handler — enhance function wrapper", () => {
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
     const onProgress = vi.fn();
-    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, onProgress);
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, onProgress, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       onProgress,
@@ -941,7 +1065,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    await modalOptions.enhanceFn("my text", "generate");
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       tools: ["read", "code_search"],
@@ -969,7 +1093,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    await modalOptions.enhanceFn("my text", "generate");
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       tools: [],
@@ -998,7 +1122,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    await modalOptions.enhanceFn("my text", "generate");
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       sessionHistory: [],
@@ -1016,7 +1140,7 @@ describe("Command handler — enhance function wrapper", () => {
     await command.handler("", ctx);
 
     const modalOptions = (PromptGenModal as ReturnType<typeof vi.fn>).mock.calls[0][0];
-    await modalOptions.enhanceFn("my text", "generate");
+    await modalOptions.enhanceFn("my text", "generate", undefined, undefined, undefined, undefined, { browse: true });
 
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       tools: [],
