@@ -314,7 +314,7 @@ describe("Input hook — prompt confirmation", () => {
     const result = await inputHandler(makeInputEvent({ text: "enhance second prompt" }), ctx);
 
     expect(select).toHaveBeenNthCalledWith(2, "Would you like to enhance this prompt?", INPUT_CHOICES_WITH_NO_DEFAULT);
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "enhance second prompt",
@@ -359,7 +359,7 @@ describe("Input hook — prompt confirmation", () => {
     const inputHandler = getRegisteredInputHandler(pi);
     const result = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
 
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
       input: "make this clear",
       cwd: "/test/project",
@@ -372,6 +372,25 @@ describe("Input hook — prompt confirmation", () => {
     expect(copyToClipboard).toHaveBeenCalledWith("make this clear");
     expect(copyToClipboard).not.toHaveBeenCalledWith("Enhanced result text");
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
+  });
+
+  it("reapplies enhanced text after OMP clears a handled input draft", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
+    ctx.ui.setEditorText("");
+    await flushAsyncWork();
+
+    expect(result).toMatchObject({ action: "handled", handled: true });
+    expect(ctx.ui.setEditorText).toHaveBeenLastCalledWith("Enhanced result text");
   });
 
   it("does not ask to enhance the next submitted resurfaced prompt", async () => {
@@ -389,7 +408,7 @@ describe("Input hook — prompt confirmation", () => {
     const firstResult = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
     const secondResult = await inputHandler(makeInputEvent({ text: "Enhanced result text" }), ctx);
 
-    expect(firstResult).toEqual({ action: "handled" });
+    expect(firstResult).toMatchObject({ action: "handled", handled: true });
     expect(secondResult).toEqual({ action: "continue" });
     expect(select).toHaveBeenCalledTimes(1);
     expect(enhancePrompt).toHaveBeenCalledTimes(1);
@@ -424,7 +443,7 @@ describe("Input hook — prompt confirmation", () => {
     const inputHandler = getRegisteredInputHandler(pi);
     const result = await inputHandler(makeInputEvent({ text: "test" }), ctx);
 
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("test");
     expect(ctx.ui.setEditorText).not.toHaveBeenCalledWith("   ");
     expect(ctx.ui.notify).toHaveBeenCalledWith(
@@ -464,7 +483,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(terminalHandler("\u001b")).toEqual({ consume: true });
     await flushAsyncWork();
 
-    expect(settledResult).toEqual({ action: "handled" });
+    expect(settledResult).toMatchObject({ action: "handled", handled: true });
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("backup pending prompt");
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(browseCodebase).not.toHaveBeenCalled();
@@ -505,7 +524,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(terminalHandler("\u001b")).toEqual({ consume: true });
 
     const result = await resultPromise;
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(browseSignal.aborted).toBe(true);
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("exact original sentence");
     expect(ctx.ui.notify).toHaveBeenCalledWith(
@@ -555,7 +574,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(() => terminalHandler("\u001b")).not.toThrow();
 
     const result = await resultPromise;
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(unsubscribe).toHaveBeenCalledTimes(1);
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Enhancement cancelled, but failed to restore original prompt. The original prompt was copied to clipboard before enhancement.",
@@ -597,7 +616,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(terminalHandler("\u001b")).toEqual({ consume: true });
 
     const result = await resultPromise;
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Could not copy original prompt to clipboard before enhancement; continuing.",
       "warning",
@@ -665,7 +684,7 @@ describe("Input hook — prompt confirmation", () => {
     expect(terminalHandler("\u001b")).toEqual({ consume: true });
 
     const result = await resultPromise;
-    expect(result).toEqual({ action: "handled" });
+    expect(result).toMatchObject({ action: "handled", handled: true });
     expect(enhanceSignal.aborted).toBe(true);
 
     resolveEnhance({
