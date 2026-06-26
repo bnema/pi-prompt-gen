@@ -174,6 +174,10 @@ describe("browseCodebase", () => {
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       thinkingLevel: "off",
       tools: ["read", "grep", "git_context", "session_history"],
+      toolNames: ["read", "grep", "git_context", "session_history"],
+      disableExtensionDiscovery: true,
+      preloadedCustomToolPaths: [],
+      enableMCP: false,
       customTools: expect.arrayContaining([
         expect.objectContaining({ name: "git_context" }),
         expect.objectContaining({ name: "session_history" }),
@@ -197,6 +201,7 @@ describe("browseCodebase", () => {
 
     expect(mockCreateAgentSession).toHaveBeenCalledWith(expect.objectContaining({
       tools: ["read", "code_search", "git_context"],
+      toolNames: ["read", "code_search", "git_context"],
     }));
   });
 
