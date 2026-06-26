@@ -74,6 +74,7 @@ type EnhanceFn = (
   previousOutput?: string,
   onProgress?: (message: string) => void,
   selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+  options?: { browse?: boolean },
 ) => ReturnType<typeof enhancePrompt>;
 
 const INLINE_STATUS_KEY = "pi-prompt-gen";
@@ -159,17 +160,18 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   const runPromptCommand = async (args: string, ctx: ExtensionCommandContext): Promise<void> => {
     await ctx.waitForIdle();
 
-    const initialText = resolveInitialText(args, ctx);
+    const parsedArgs = parsePromptCommandArgs(args);
+    const initialText = parsedArgs.text ? parsedArgs.text : resolveShortcutPrefill(ctx);
     const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
-    const initialTextLabel = resolvePrefillLabel(args, ctx);
+    const initialTextLabel = parsedArgs.text ? "from args" : resolveShortcutPrefillLabel(ctx);
     const notify = (msg: string, type?: "info" | "warning" | "error") => ctx.ui.notify(msg, type);
 
     const browseTools = resolveBrowseToolNames(pi);
 
-    if (args.trim()) {
+    if (parsedArgs.text) {
       const enhanceConfig = await resolveEnhanceConfig(ctx);
       if (!enhanceConfig) return;
-      await runInlineEnhancement(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify);
+      await runInlineEnhancement(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, undefined, { browse: parsedArgs.browse });
       return;
     }
 
@@ -189,6 +191,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       initialMode,
       enhanceConfig,
       browseTools,
+      initialBrowseEnabled: parsedArgs.browse,
       notify,
     });
   };
@@ -290,6 +293,30 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
   });
 }
 
+function parsePromptCommandArgs(args: string): PromptCommandArgs {
+  const tokens = args.trim().split(/\s+/).filter(Boolean);
+  let browse = false;
+  let index = 0;
+
+  for (; index < tokens.length; index++) {
+    const token = tokens[index];
+    if (token === "--") {
+      index += 1;
+      break;
+    }
+    if (token === "--browse" || token === "-b") {
+      browse = true;
+      continue;
+    }
+    break;
+  }
+
+  return {
+    browse,
+    text: tokens.slice(index).join(" "),
+  };
+}
+
 function canOpenPromptGenModal(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">): boolean {
   return ctx.hasUI &&
     typeof ctx.ui.custom === "function" &&
@@ -315,6 +342,7 @@ interface OpenPromptGenModalOptions {
   initialMode: EnhancerMode;
   enhanceConfig: ResolvedEnhanceConfig;
   browseTools: string[];
+  initialBrowseEnabled?: boolean;
   notify: (msg: string, type?: "info" | "warning" | "error") => void;
 }
 
@@ -332,6 +360,7 @@ async function openPromptGenModal(
     initialText: options.initialText,
     initialTextLabel: options.initialTextLabel,
     mode: options.initialMode,
+    initialBrowseEnabled: options.initialBrowseEnabled,
     enhanceFn,
     availableModels,
     selectedModel: currentSelection.model,
@@ -377,6 +406,7 @@ function createEnhanceFn(
     previousOutput?: string,
     onProgress?: (message: string) => void,
     selectionOverride?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+    enhanceOptions?: { browse?: boolean },
   ) => {
     throwIfAborted(signal);
 
@@ -390,7 +420,8 @@ function createEnhanceFn(
     if (!selectedConfig) throw new Error(`No API key configured for ${selection.model.provider}.`);
     const selectedApiKey = selectedConfig.apiKey ?? "";
 
-    const browseResult = ctx.cwd
+    const shouldBrowse = enhanceOptions?.browse === true;
+    const browseResult = shouldBrowse && ctx.cwd
       ? await runOptionalBrowseCodebase({
         input: text,
         cwd: ctx.cwd,
@@ -424,7 +455,7 @@ function createEnhanceFn(
       ...result,
       metadata: {
         ...result.metadata,
-        browseToolsUsed: browseTools,
+        browseToolsUsed: shouldBrowse ? browseTools : [],
       },
     };
   };
@@ -699,12 +730,6 @@ function throwIfAborted(signal?: AbortSignal): void {
 // Prefill helpers
 // ---------------------------------------------------------------------------
 
-function resolveInitialText(args: string, ctx: ExtensionCommandContext): string {
-  const fromArgs = args.trim();
-  if (fromArgs) return fromArgs;
-  return resolveShortcutPrefill(ctx);
-}
-
 function resolveShortcutPrefill(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui" | "sessionManager">): string {
   if (ctx.hasUI) {
     const editorText = ctx.ui.getEditorText()?.trim();
@@ -766,11 +791,6 @@ function resolveBrowseSessionHistory(
 // ---------------------------------------------------------------------------
 // Prefill source labels
 // ---------------------------------------------------------------------------
-
-function resolvePrefillLabel(args: string, ctx: ExtensionCommandContext): string {
-  if (args.trim()) return "from args";
-  return resolveShortcutPrefillLabel(ctx);
-}
 
 function resolveShortcutPrefillLabel(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui" | "sessionManager">): string {
   if (ctx.hasUI) {
@@ -842,6 +862,11 @@ interface RunInlineEnhancementOptions {
   writeResultToClipboard?: boolean;
 }
 
+interface PromptCommandArgs {
+  browse: boolean;
+  text: string;
+}
+
 type InlineEnhancementOutcome =
   | { status: "enhanced"; text: string }
   | { status: "cancelled" }
@@ -855,6 +880,7 @@ async function runInlineEnhancement(
   enhanceFn: EnhanceFn,
   notify: (msg: string, type?: "info" | "warning" | "error") => void,
   options: RunInlineEnhancementOptions = {},
+  enhanceOptions?: { browse?: boolean },
 ): Promise<InlineEnhancementOutcome> {
   if (!ctx.hasUI) {
     throw new Error(NO_UI_ERROR_MESSAGE);
@@ -905,7 +931,7 @@ async function runInlineEnhancement(
   let metadataSummary = "";
   const enhancePromise = enhanceFn(text, mode, abortController.signal, undefined, (message) => {
     if (!cancelled) progress.update(message);
-  });
+  }, undefined, enhanceOptions);
   enhancePromise.catch(() => undefined);
 
   try {

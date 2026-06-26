@@ -193,6 +193,59 @@ describe("PromptGenModal construction", () => {
 });
 
 describe("PromptGenModal mode toggle", () => {
+  it("toggles repo context on Alt+b", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "fix the sidebar sort",
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    expect(modal.render(100).join("\n")).toContain("Repo:off");
+
+    press(modal, "\u001bb"); // Alt+b
+    expect(modal.render(100).join("\n")).toContain("Repo:on");
+
+    press(modal, "\r");
+
+    await vi.waitFor(() => {
+      expect(enhanceFn).toHaveBeenCalledWith(
+        "fix the sidebar sort",
+        "rewrite",
+        expect.any(AbortSignal),
+        undefined,
+        expect.any(Function),
+        undefined,
+        { browse: true },
+      );
+    });
+  });
+
+  it("passes repo context request when initialBrowseEnabled is true", async () => {
+    const enhanceFn = vi.fn().mockResolvedValue(makeEnhanceResult());
+    const modal = new PromptGenModal(makeModalOptions({
+      initialText: "fix the sidebar sort",
+      initialBrowseEnabled: true,
+      enhanceFn,
+    }));
+    bindModal(modal);
+
+    expect(modal.render(100).join("\n")).toContain("Repo:on");
+    press(modal, "\r");
+
+    await vi.waitFor(() => {
+      expect(enhanceFn).toHaveBeenCalledWith(
+        "fix the sidebar sort",
+        "rewrite",
+        expect.any(AbortSignal),
+        undefined,
+        expect.any(Function),
+        undefined,
+        { browse: true },
+      );
+    });
+  });
+
   it("toggles mode on Alt+m", () => {
     const modal = new PromptGenModal(makeModalOptions({ mode: "rewrite" }));
     bindModal(modal);
@@ -303,6 +356,7 @@ describe("PromptGenModal model and thinking shortcuts", () => {
         undefined,
         expect.any(Function),
         { model, thinkingLevel: "high" },
+        undefined,
       );
     });
   });
@@ -438,7 +492,7 @@ describe("PromptGenModal text editing", () => {
 
     // The enhanceFn should have been called
     expect(enhanceFn).toHaveBeenCalledTimes(1);
-    expect(enhanceFn).toHaveBeenCalledWith("test", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function));
+    expect(enhanceFn).toHaveBeenCalledWith("test", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function), undefined, undefined);
   });
 
   it("handles arrow key navigation", () => {
@@ -526,7 +580,7 @@ describe("PromptGenModal enhancement lifecycle", () => {
     await vi.runAllTimersAsync();
     await vi.waitFor(() => {
       expect(enhanceFn).toHaveBeenCalledTimes(1);
-      expect(enhanceFn).toHaveBeenCalledWith("fix the sort", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function));
+      expect(enhanceFn).toHaveBeenCalledWith("fix the sort", "rewrite", expect.any(AbortSignal), undefined, expect.any(Function), undefined, undefined);
       expect(onEnhanceResult).toHaveBeenCalled();
     });
 
@@ -919,6 +973,8 @@ describe("PromptGenModal regenerate/alternative", () => {
         expect.any(AbortSignal),
         "Enhanced: fix the sidebar sort order to use `createdAt` descending.",
         expect.any(Function),
+        undefined,
+        undefined,
       );
     });
   });
@@ -1001,6 +1057,7 @@ describe("PromptGenModal render output", () => {
     // When idle (no result yet), show primary action help
     expect(joined).toContain("[Enter] Enhance");
     expect(joined).toContain("[Alt+M] Mode");
+    expect(joined).toContain("[Alt+B] Repo");
     expect(joined).toContain("[Alt+C] Clear");
     expect(joined).toContain("[Esc] Close");
     // Secondary actions still shown

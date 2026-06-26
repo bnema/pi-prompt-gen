@@ -16,6 +16,7 @@
  *   Enter        enhance / re-enhance
  *   Alt+r        regenerate / alternative (materially different output)
  *   Alt+m        toggle rewrite / generate mode
+ *   Alt+b        toggle repo context browsing
  *   Alt+c        clear draft
  *   Alt+y        yank (copy) enhanced result to clipboard
  *   Alt+e        export / copy metadata artifact (excludes prompt body)
@@ -75,6 +76,8 @@ export interface PromptGenModalOptions {
   initialTextLabel?: string;
   /** Initial mode. Auto-detected from initialText when not provided. */
   mode?: EnhancerMode;
+  /** Whether enhancement should request repo/context browsing. Defaults to false for fast prompt-only enhancement. */
+  initialBrowseEnabled?: boolean;
   /** Available models that can be selected inside the modal. */
   availableModels?: Model<Api>[];
   /** Currently selected model for modal-triggered enhancement. */
@@ -91,6 +94,7 @@ export interface PromptGenModalOptions {
     previousOutput?: string,
     onProgress?: (message: string) => void,
     selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+    options?: { browse?: boolean },
   ) => Promise<EnhancePromptResult>;
   /** Copy text to clipboard. */
   copyFn: (text: string) => Promise<void>;
@@ -212,6 +216,7 @@ export class PromptGenModal implements TuiComponent {
   private spinnerFrameIndex = 0;
   private spinnerTimer: ReturnType<typeof setInterval> | undefined;
   private progressLog: string[] = [];
+  private browseEnabled = false;
   private pasteBuffer = "";
   private isInPaste = false;
 
@@ -228,6 +233,7 @@ export class PromptGenModal implements TuiComponent {
     previousOutput?: string,
     onProgress?: (message: string) => void,
     selection?: { model?: Model<Api>; thinkingLevel?: ModelThinkingLevel },
+    options?: { browse?: boolean },
   ) => Promise<EnhancePromptResult>;
   private copyFn: (text: string) => Promise<void>;
   private applyFn: (text: string) => void;
@@ -239,6 +245,7 @@ export class PromptGenModal implements TuiComponent {
   constructor(options: PromptGenModalOptions) {
     this.draft = options.initialText ?? "";
     this.mode = options.mode ?? (this.draft.trim() ? "rewrite" : "generate");
+    this.browseEnabled = options.initialBrowseEnabled === true;
     this.selectionController = new PromptModelSelectionController({
       availableModels: options.availableModels,
       selectedModel: options.selectedModel,
@@ -403,7 +410,7 @@ export class PromptGenModal implements TuiComponent {
         `[Alt+E] Meta  [Alt+Y] Copy  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
         this.theme,
       ));
-      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking`, inner));
+      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking  [Alt+B] Repo`, inner));
     } else {
       lines.push(dim(
         `[Enter] Enhance  [Alt+R] Regenerate  [Alt+M] Mode  [Alt+C] Clear`,
@@ -413,7 +420,7 @@ export class PromptGenModal implements TuiComponent {
         `[Alt+Y] Copy  [Alt+E] Meta  [Alt+A] Apply  [Alt+S] Send  [Esc] Close`,
         this.theme,
       ));
-      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking`, inner));
+      lines.push(this.renderFooterStatus(`[Ctrl+P] Model  [Shift+T] Thinking  [Alt+B] Repo`, inner));
     }
 
     return frameContent(lines, width, "/prompt", this.theme);
@@ -460,6 +467,11 @@ export class PromptGenModal implements TuiComponent {
     }
     if (this.matchesAction(data, "alt+m", Key.alt("m"))) {
       this.toggleMode();
+      this.requestRender();
+      return;
+    }
+    if (this.matchesAction(data, "alt+b", Key.alt("b"))) {
+      this.toggleBrowseEnabled();
       this.requestRender();
       return;
     }
@@ -781,6 +793,13 @@ export class PromptGenModal implements TuiComponent {
     this.setStatus("idle", `switched to ${this.mode}`);
   }
 
+  private toggleBrowseEnabled(): void {
+    this.browseEnabled = !this.browseEnabled;
+    this.result = undefined;
+    this.resetProgress();
+    this.setStatus("idle", `repo context ${this.browseEnabled ? "on" : "off"}`);
+  }
+
   private clearDraft(): void {
     this.draft = "";
     this.cursor = 0;
@@ -810,7 +829,7 @@ export class PromptGenModal implements TuiComponent {
 
   private renderFooterStatus(helpText: string, inner: number): string {
     const help = dim(helpText, this.theme);
-    const selection = dim(this.selectionController.label(), this.theme);
+    const selection = dim(`${this.selectionController.label()}  Repo:${this.browseEnabled ? "on" : "off"}`, this.theme);
     const gap = Math.max(1, inner - visibleWidth(help) - visibleWidth(selection));
     return help + " ".repeat(gap) + selection;
   }
@@ -838,9 +857,16 @@ export class PromptGenModal implements TuiComponent {
         this.requestRender();
       };
       const selection = this.selectionController.selection();
-      const result = selection
-        ? await this.enhanceFn(text, this.mode, controller.signal, previousOutput, onProgress, selection)
-        : await this.enhanceFn(text, this.mode, controller.signal, previousOutput, onProgress);
+      const requestOptions = this.browseEnabled ? { browse: true } : undefined;
+      const result = await this.enhanceFn(
+        text,
+        this.mode,
+        controller.signal,
+        previousOutput,
+        onProgress,
+        selection,
+        requestOptions,
+      );
       if (controller.signal.aborted || requestId !== this.requestVersion) return;
       this.result = result;
       this.setStatus("enhanced", "");

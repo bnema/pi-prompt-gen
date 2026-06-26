@@ -221,6 +221,25 @@ function flushAsyncWork(): Promise<void> {
   return new Promise((resolve) => setImmediate(resolve));
 }
 
+function makeLateEnhanceResult(): Awaited<ReturnType<typeof mockEnhancePrompt>> {
+  return {
+    enhancedPrompt: "late enhanced text",
+    refs: [],
+    gitContext: undefined,
+    sessionContext: undefined,
+    systemPrompt: "",
+    modelResult: { content: "late enhanced text", stopReason: "stop" },
+    metadata: {
+      modelId: "test-model",
+      modelName: "Test Model",
+      modelProvider: "test-provider",
+      latencyMs: 500,
+      refCount: 0,
+      stopReason: "stop",
+    },
+  };
+}
+
 beforeEach(() => {
   rmSync(testPaths.agentDir, { recursive: true, force: true });
   vi.clearAllMocks();
@@ -527,10 +546,7 @@ describe("Input hook — prompt confirmation", () => {
     const result = await inputHandler(makeInputEvent({ text: "make this clear" }), ctx);
 
     expect(result).toMatchObject({ action: "handled", handled: true });
-    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
-      input: "make this clear",
-      cwd: "/test/project",
-    }));
+    expect(browseCodebase).not.toHaveBeenCalled();
     expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
       input: "make this clear",
       mode: "rewrite",
@@ -660,12 +676,11 @@ describe("Input hook — prompt confirmation", () => {
     await resultPromise;
   });
 
-  it("handles Escape during browse by aborting, restoring original input, and not sending stale text", async () => {
-    let resolveBrowse!: (value: { refs: [] }) => void;
-    const browsePromise = new Promise<{ refs: [] }>((resolve) => {
-      resolveBrowse = resolve;
-    });
-    mockBrowseCodebase.mockReturnValueOnce(browsePromise);
+  it("handles Escape during enhancement by aborting, restoring original input, and not sending stale text", async () => {
+    let resolveEnhance!: (value: Awaited<ReturnType<typeof mockEnhancePrompt>>) => void;
+    mockEnhancePrompt.mockReturnValueOnce(new Promise((resolve) => {
+      resolveEnhance = resolve;
+    }));
 
     const unsubscribe = vi.fn();
     const ui = {
@@ -682,17 +697,17 @@ describe("Input hook — prompt confirmation", () => {
 
     await vi.waitFor(() => {
       expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
-      expect(browseCodebase).toHaveBeenCalledTimes(1);
+      expect(enhancePrompt).toHaveBeenCalledTimes(1);
     });
 
-    const browseSignal = (browseCodebase as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0].signal as AbortSignal;
+    const enhanceSignal = (enhancePrompt as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0].signal as AbortSignal;
     const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
     expect(terminalHandler("x")).toBeUndefined();
     expect(terminalHandler("\u001b")).toEqual({ consume: true });
 
     const result = await resultPromise;
     expect(result).toMatchObject({ action: "handled", handled: true });
-    expect(browseSignal.aborted).toBe(true);
+    expect(enhanceSignal.aborted).toBe(true);
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("exact original sentence");
     expect(ctx.ui.notify).toHaveBeenCalledWith(
       "Enhancement cancelled; restored original prompt.",
@@ -701,9 +716,9 @@ describe("Input hook — prompt confirmation", () => {
     expect(ctx.ui.setStatus).toHaveBeenLastCalledWith("pi-prompt-gen", undefined);
     expect(unsubscribe).toHaveBeenCalledTimes(1);
 
-    resolveBrowse({ refs: [] });
+    resolveEnhance(makeLateEnhanceResult());
     await flushAsyncWork();
-    expect(enhancePrompt).not.toHaveBeenCalled();
+    expect(browseCodebase).not.toHaveBeenCalled();
     expect(copyToClipboard).toHaveBeenCalledTimes(1);
     expect(copyToClipboard).toHaveBeenCalledWith("exact original sentence");
     expect(copyToClipboard).not.toHaveBeenCalledWith("Enhanced result text");
@@ -711,9 +726,9 @@ describe("Input hook — prompt confirmation", () => {
   });
 
   it("warns and still cancels when restoring original input fails", async () => {
-    let resolveBrowse!: (value: { refs: [] }) => void;
-    mockBrowseCodebase.mockReturnValueOnce(new Promise<{ refs: [] }>((resolve) => {
-      resolveBrowse = resolve;
+    let resolveEnhance!: (value: Awaited<ReturnType<typeof mockEnhancePrompt>>) => void;
+    mockEnhancePrompt.mockReturnValueOnce(new Promise((resolve) => {
+      resolveEnhance = resolve;
     }));
 
     const unsubscribe = vi.fn();
@@ -734,7 +749,7 @@ describe("Input hook — prompt confirmation", () => {
 
     await vi.waitFor(() => {
       expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
-      expect(browseCodebase).toHaveBeenCalledTimes(1);
+      expect(enhancePrompt).toHaveBeenCalledTimes(1);
     });
 
     const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
@@ -748,16 +763,16 @@ describe("Input hook — prompt confirmation", () => {
       "warning",
     );
 
-    resolveBrowse({ refs: [] });
+    resolveEnhance(makeLateEnhanceResult());
     await flushAsyncWork();
-    expect(enhancePrompt).not.toHaveBeenCalled();
+    expect(browseCodebase).not.toHaveBeenCalled();
   });
 
   it("does not claim clipboard recovery when backup and editor restore both fail", async () => {
     vi.mocked(copyToClipboard).mockRejectedValueOnce(new Error("copy failed"));
-    let resolveBrowse!: (value: { refs: [] }) => void;
-    mockBrowseCodebase.mockReturnValueOnce(new Promise<{ refs: [] }>((resolve) => {
-      resolveBrowse = resolve;
+    let resolveEnhance!: (value: Awaited<ReturnType<typeof mockEnhancePrompt>>) => void;
+    mockEnhancePrompt.mockReturnValueOnce(new Promise((resolve) => {
+      resolveEnhance = resolve;
     }));
 
     const ui = {
@@ -776,7 +791,7 @@ describe("Input hook — prompt confirmation", () => {
 
     await vi.waitFor(() => {
       expect(ctx.ui.onTerminalInput).toHaveBeenCalledTimes(1);
-      expect(browseCodebase).toHaveBeenCalledTimes(1);
+      expect(enhancePrompt).toHaveBeenCalledTimes(1);
     });
 
     const terminalHandler = (ctx.ui.onTerminalInput as unknown as ReturnType<typeof vi.fn>).mock.calls[0][0] as (data: string) => { consume?: boolean } | undefined;
@@ -797,9 +812,9 @@ describe("Input hook — prompt confirmation", () => {
       "warning",
     );
 
-    resolveBrowse({ refs: [] });
+    resolveEnhance(makeLateEnhanceResult());
     await flushAsyncWork();
-    expect(enhancePrompt).not.toHaveBeenCalled();
+    expect(browseCodebase).not.toHaveBeenCalled();
   });
 
   it("treats provider AbortError as an enhancement failure unless the inline signal was aborted", async () => {
