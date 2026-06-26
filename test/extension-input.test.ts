@@ -197,6 +197,17 @@ function getRegisteredSessionStartHandler(
   return call[1] as (event: SessionStartEvent, ctx: ExtensionContext) => void | Promise<void>;
 }
 
+function getRegisteredHandler(
+  pi: ExtensionAPI,
+  eventName: string,
+): (event: Record<string, unknown>, ctx: ExtensionContext) => void | Promise<void> {
+  const call = (pi.on as ReturnType<typeof vi.fn>).mock.calls.find(
+    (entry: unknown[]) => entry[0] === eventName,
+  );
+  if (!call) throw new Error(`${eventName} handler was not registered`);
+  return call[1] as (event: Record<string, unknown>, ctx: ExtensionContext) => void | Promise<void>;
+}
+
 function makeInputEvent(overrides?: Partial<InputEvent>): InputEvent {
   return {
     type: "input",
@@ -253,6 +264,162 @@ describe("Input hook — prompt confirmation", () => {
 
     expect(ctx.ui.select).toHaveBeenCalledWith("Would you like to enhance this prompt?", INPUT_CHOICES);
     expect(result).toEqual({ action: "continue" });
+  });
+
+  it("does not prompt while the session is busy compacting or processing another turn", async () => {
+    const ctx = makeMockContext({
+      isIdle: vi.fn().mockReturnValue(false),
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "follow up while compacting" }), ctx);
+
+    expect(result).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+    expect(enhancePrompt).not.toHaveBeenCalled();
+  });
+
+  it("does not prompt while compaction lifecycle events are active", async () => {
+    const ctx = makeMockContext({
+      isIdle: vi.fn().mockReturnValue(true),
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const compactionStart = getRegisteredHandler(pi, "auto_compaction_start");
+    const compactionEnd = getRegisteredHandler(pi, "auto_compaction_end");
+
+    await compactionStart({ type: "auto_compaction_start", reason: "idle", action: "snapcompact" }, ctx);
+    const skipped = await inputHandler(makeInputEvent({ text: "queued while compacting" }), ctx);
+
+    expect(skipped).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+
+    await compactionEnd({
+      type: "auto_compaction_end",
+      action: "snapcompact",
+      result: undefined,
+      aborted: false,
+      willRetry: false,
+    }, ctx);
+    const afterCompaction = await inputHandler(makeInputEvent({ text: "normal prompt after compacting" }), ctx);
+
+    expect(afterCompaction).toEqual({ action: "continue" });
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not prompt between manual compaction lifecycle events", async () => {
+    const ctx = makeMockContext({
+      isIdle: vi.fn().mockReturnValue(true),
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const compactionStart = getRegisteredHandler(pi, "session_before_compact");
+    const compactionEnd = getRegisteredHandler(pi, "session_compact");
+
+    await compactionStart({
+      type: "session_before_compact",
+      preparation: {},
+      branchEntries: [],
+      signal: new AbortController().signal,
+    }, ctx);
+    const skipped = await inputHandler(makeInputEvent({ text: "queued during manual compact" }), ctx);
+
+    expect(skipped).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+
+    await compactionEnd({ type: "session_compact", compactionEntry: {}, fromExtension: false }, ctx);
+    await inputHandler(makeInputEvent({ text: "normal prompt after manual compact" }), ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("keeps skipping prompts until overlapping auto and manual compactions have both ended", async () => {
+    const ctx = makeMockContext({
+      isIdle: vi.fn().mockReturnValue(true),
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const autoStart = getRegisteredHandler(pi, "auto_compaction_start");
+    const autoEnd = getRegisteredHandler(pi, "auto_compaction_end");
+    const manualStart = getRegisteredHandler(pi, "session_before_compact");
+    const manualEnd = getRegisteredHandler(pi, "session_compact");
+
+    await autoStart({ type: "auto_compaction_start", reason: "idle", action: "snapcompact" }, ctx);
+    await manualStart({
+      type: "session_before_compact",
+      preparation: {},
+      branchEntries: [],
+      signal: new AbortController().signal,
+    }, ctx);
+    await autoEnd({
+      type: "auto_compaction_end",
+      action: "snapcompact",
+      result: undefined,
+      aborted: false,
+      willRetry: false,
+    }, ctx);
+    const stillSkipped = await inputHandler(makeInputEvent({ text: "still compacting manually" }), ctx);
+
+    expect(stillSkipped).toEqual({ action: "continue" });
+    expect(ctx.ui.select).not.toHaveBeenCalled();
+
+    await manualEnd({ type: "session_compact", compactionEntry: {}, fromExtension: false }, ctx);
+    await inputHandler(makeInputEvent({ text: "normal prompt after both compactions" }), ctx);
+
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
+  });
+
+  it("re-enables prompting when manual compaction is aborted", async () => {
+    const controller = new AbortController();
+    const ctx = makeMockContext({
+      isIdle: vi.fn().mockReturnValue(true),
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("No"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const compactionStart = getRegisteredHandler(pi, "session_before_compact");
+
+    await compactionStart({
+      type: "session_before_compact",
+      preparation: {},
+      branchEntries: [],
+      signal: controller.signal,
+    }, ctx);
+    const skipped = await inputHandler(makeInputEvent({ text: "queued before aborted compact" }), ctx);
+    controller.abort();
+    await inputHandler(makeInputEvent({ text: "prompt after aborted compact" }), ctx);
+
+    expect(skipped).toEqual({ action: "continue" });
+    expect(ctx.ui.select).toHaveBeenCalledTimes(1);
   });
 
   it("continues with the original message unchanged when the user selects No", async () => {
