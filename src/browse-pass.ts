@@ -103,6 +103,23 @@ export interface BrowseCodebaseOptions {
   onProgress?: (message: string) => void;
 }
 
+type CompatCreateAgentSessionOptions = NonNullable<Parameters<typeof createAgentSession>[0]> & {
+  /**
+   * OMP renamed the legacy Pi `tools` option to `toolNames`.
+   * Keep both fields at runtime so the isolated browse scout receives the same
+   * active tool set in both hosts without dropping vanilla Pi compatibility.
+   */
+  toolNames?: string[];
+  /**
+   * OMP-only isolation switches. The browse scout must not inherit arbitrary
+   * host extensions, project custom tools, or MCP servers; only the explicit
+   * safe tool names plus the internal SDK customTools are intended.
+   */
+  disableExtensionDiscovery?: boolean;
+  preloadedCustomToolPaths?: [];
+  enableMCP?: boolean;
+};
+
 interface ParsedBrowseResult {
   refs: ParsedRef[];
   gitContext?: GitContext;
@@ -204,7 +221,7 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Br
   await loader.reload();
   throwIfAborted(signal);
 
-  const { session } = await createAgentSession({
+  const sessionOptions: CompatCreateAgentSessionOptions = {
     cwd,
     agentDir: getAgentDir(),
     model,
@@ -213,10 +230,15 @@ export async function browseCodebase(options: BrowseCodebaseOptions): Promise<Br
     modelRegistry,
     resourceLoader: loader,
     tools: activeTools,
+    toolNames: activeTools,
+    disableExtensionDiscovery: true,
+    preloadedCustomToolPaths: [],
+    enableMCP: false,
     customTools,
     sessionManager: SessionManager.inMemory(cwd),
     settingsManager,
-  });
+  };
+  const { session } = await createAgentSession(sessionOptions);
 
   let unsubscribe = () => {};
   const abort = () => {
