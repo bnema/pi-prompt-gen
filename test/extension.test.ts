@@ -365,6 +365,23 @@ describe("Command handler — prefill behavior (TUI)", () => {
     expect(copyToClipboard).toHaveBeenNthCalledWith(1, "fix the sidebar sort");
   });
 
+  it("accepts #browse in inline prompt text as a repo browsing opt-in", async () => {
+    const ctx = makeMockContext();
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const command = (pi.registerCommand as ReturnType<typeof vi.fn>).mock.calls[0][1];
+    await command.handler("fix the sidebar sort #browse.", ctx);
+
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort #browse.",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "fix the sidebar sort #browse.",
+    }));
+  });
+
   it("accepts -b as a short browse flag", async () => {
     const ctx = makeMockContext();
     const pi = makeExtensionAPI();

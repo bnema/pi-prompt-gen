@@ -164,6 +164,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     const initialText = parsedArgs.text ? parsedArgs.text : resolveShortcutPrefill(ctx);
     const initialMode: EnhancerMode = initialText ? "rewrite" : "generate";
     const initialTextLabel = parsedArgs.text ? "from args" : resolveShortcutPrefillLabel(ctx);
+    const initialBrowseEnabled = parsedArgs.browse || hasBrowseOptIn(initialText);
     const notify = (msg: string, type?: "info" | "warning" | "error") => ctx.ui.notify(msg, type);
 
     const browseTools = resolveBrowseToolNames(pi);
@@ -171,14 +172,14 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
     if (parsedArgs.text) {
       const enhanceConfig = await resolveEnhanceConfig(ctx);
       if (!enhanceConfig) return;
-      await runInlineEnhancement(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, undefined, { browse: parsedArgs.browse });
+      await runInlineEnhancement(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, undefined, { browse: initialBrowseEnabled });
       return;
     }
 
     if (!canOpenPromptGenModal(ctx)) {
       const enhanceConfig = await resolveEnhanceConfig(ctx);
       if (!enhanceConfig) return;
-      await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, { browse: parsedArgs.browse });
+      await runNonTuiFallback(ctx, initialText, initialMode, createEnhanceFn(ctx, enhanceConfig, browseTools), notify, { browse: initialBrowseEnabled });
       return;
     }
 
@@ -191,7 +192,7 @@ export default function registerPiPromptGen(pi: ExtensionAPI): void {
       initialMode,
       enhanceConfig,
       browseTools,
-      initialBrowseEnabled: parsedArgs.browse,
+      initialBrowseEnabled,
       notify,
     });
   };
@@ -311,6 +312,12 @@ function parsePromptCommandArgs(args: string): PromptCommandArgs {
   return { browse, text: rest.trim() };
 }
 
+const BROWSE_OPT_IN_PATTERN = /(^|[\s([{])#browse(?=$|[\s\]).,;:!?}])/i;
+
+function hasBrowseOptIn(text: string): boolean {
+  return BROWSE_OPT_IN_PATTERN.test(text);
+}
+
 function canOpenPromptGenModal(ctx: Pick<ExtensionCommandContext, "hasUI" | "ui">): boolean {
   return ctx.hasUI &&
     typeof ctx.ui.custom === "function" &&
@@ -414,7 +421,7 @@ function createEnhanceFn(
     if (!selectedConfig) throw new Error(`No API key configured for ${selection.model.provider}.`);
     const selectedApiKey = selectedConfig.apiKey ?? "";
 
-    const shouldBrowse = enhanceOptions?.browse === true;
+    const shouldBrowse = enhanceOptions?.browse === true || hasBrowseOptIn(text);
     const browseResult = shouldBrowse && ctx.cwd
       ? await runOptionalBrowseCodebase({
         input: text,

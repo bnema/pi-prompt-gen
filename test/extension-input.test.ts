@@ -557,6 +557,30 @@ describe("Input hook — prompt confirmation", () => {
     expect(ctx.ui.setEditorText).toHaveBeenCalledWith("Enhanced result text");
   });
 
+  it("uses #browse in outgoing user text as a repo browsing opt-in", async () => {
+    const ctx = makeMockContext({
+      ui: {
+        ...makeMockContext().ui,
+        select: vi.fn().mockResolvedValue("Yes"),
+      } as ExtensionUIContext,
+    });
+    const pi = makeExtensionAPI();
+
+    registerPiPromptGen(pi);
+    const inputHandler = getRegisteredInputHandler(pi);
+    const result = await inputHandler(makeInputEvent({ text: "make this clear #browse" }), ctx);
+
+    expect(result).toMatchObject({ action: "handled", handled: true });
+    expect(browseCodebase).toHaveBeenCalledWith(expect.objectContaining({
+      input: "make this clear #browse",
+      cwd: "/test/project",
+    }));
+    expect(enhancePrompt).toHaveBeenCalledWith(expect.objectContaining({
+      input: "make this clear #browse",
+      mode: "rewrite",
+    }));
+  });
+
   it("reapplies enhanced text after OMP clears a handled input draft", async () => {
     const ctx = makeMockContext({
       ui: {
